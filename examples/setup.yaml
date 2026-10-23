@@ -1,0 +1,35 @@
+setup_id: my-speaker-at-measurement-position
+chain_notes: >-
+  EDIT before measuring. Record microphone and calibrator models/serials,
+  conditioner gain/filter/output settings, speaker/amplifier and gain,
+  cabling, microphone position/orientation and measurement geometry.
+daq:
+  input_channel: Dev1/ai0
+  output_channel: Dev1/ao0
+  sample_rate_hz: 200000
+  terminal_configuration: differential
+  input_min_v: -10.0
+  input_max_v: 10.0
+  max_peak_v: 0.5
+reference_level_db: 94.0
+reference_frequency_hz: 1000.0
+reference_duration_s: 2.0
+reference_max_span_db: 0.2
+measurement:
+  # null: all AC FFT bins up to Nyquist. Specify e.g. [5000, 80000] if appropriate.
+  band_hz: null
+  # This interval is relative to the digital waveform, before acoustic_delay_s.
+  start_s: 0.0
+  stop_s: null
+  acoustic_delay_s: 0.0
+  # Additive corrections relative to the reference frequency, e.g.
+  # [[0, 0], [1000, 0], [10000, -1.2], [100000, -2.0]].
+  # Empty means NO microphone frequency-response correction.
+  frequency_correction_db: []
+  tolerance_db: 0.5
+  minimum_snr_db: 10.0
+  max_upward_step_db: 6.0
+  max_iterations: 20
+  confirmations: 2
+  start_scale_v: 0.001
+  input_clip_fraction: 0.98

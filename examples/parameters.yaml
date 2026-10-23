@@ -1,0 +1,4 @@
+duration_s: 2.0
+carrier_hz: 10000.0
+am_hz: 8.0
+seed: 42

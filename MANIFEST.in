@@ -1,0 +1,3 @@
+include README.md uv.lock .python-version
+recursive-include examples *.py *.yaml
+recursive-include tests *.py

@@ -1,0 +1,32 @@
+[project]
+name = "ni-spl-calibration"
+version = "0.1.0"
+description = "Waveform-specific sound pressure calibration with an NI DAQ"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26", "soundfile>=0.12", "PyYAML>=6.0"]
+
+[project.optional-dependencies]
+daq = ["nidaqmx>=1.0"]
+dev = ["pytest>=8.2", "ruff>=0.12"]
+
+[project.scripts]
+ni-spl = "ni_spl_calibration.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]
