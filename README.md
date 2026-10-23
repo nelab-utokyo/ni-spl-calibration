@@ -13,16 +13,18 @@ WAV / 生成関数 / 配列 → DAQ AO → アンプ → スピーカー → マ
 
 ## 導入
 
-Python 3.11以上と[uv](https://docs.astral.sh/uv/)を使用します。配布ZIPを展開し、そのディレクトリで実行してください。
+Git、Python 3.11以上、[uv](https://docs.astral.sh/uv/)を使用します。リポジトリをcloneし、そのディレクトリで実行してください。
 
 ```sh
+git clone https://github.com/kmraven/ni-spl-calibration.git
+cd ni-spl-calibration
 uv sync --locked --extra daq
 uv run ni-spl --help
 ```
 
 実機には、DAQ機種とOSに対応した **NI-DAQmxドライバ**も必要です。Pythonパッケージだけでは動きません。[NI公式ドキュメント](https://nidaqmx-python.readthedocs.io/en/stable/)を参照してください。Windows/Linuxのドライバ対応環境を対象とします。
 
-pipの場合は `python -m pip install ".[daq]"` でインストールできます。配布物には `uv.lock` を含み、uvでは同じ依存バージョンを再現できます。
+pipの場合はリポジトリ直下で `python -m pip install ".[daq]"` を実行してインストールできます。リポジトリには `uv.lock` を含み、uvでは同じ依存バージョンを再現できます。
 
 ## 実機なしで一通り確認する
 

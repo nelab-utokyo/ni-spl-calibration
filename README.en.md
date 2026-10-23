@@ -13,16 +13,18 @@ WAV / generator / array → DAQ AO → amplifier → speaker → microphone → 
 
 ## Installation
 
-Use Python 3.11 or later and [uv](https://docs.astral.sh/uv/). Extract the distribution ZIP and run these commands from the extracted directory:
+Use Git, Python 3.11 or later, and [uv](https://docs.astral.sh/uv/). Clone the repository and run the commands from its root directory:
 
 ```sh
+git clone https://github.com/kmraven/ni-spl-calibration.git
+cd ni-spl-calibration
 uv sync --locked --extra daq
 uv run ni-spl --help
 ```
 
 Physical hardware also requires the **NI-DAQmx driver** appropriate for your DAQ model and operating system. Installing the Python package alone is insufficient. See the [official NI documentation](https://nidaqmx-python.readthedocs.io/en/stable/). The hardware backend targets Windows/Linux environments supported by the driver.
 
-For pip, use `python -m pip install ".[daq]"`. The distribution includes `uv.lock` so uv can reproduce the dependency versions.
+For pip, run `python -m pip install ".[daq]"` from the repository root. The repository includes `uv.lock` so uv can reproduce the dependency versions.
 
 ## Try the complete workflow without hardware
 
