@@ -11,7 +11,7 @@ def main():
             raise
         print(
             "GUIを使用するには uv sync --locked --extra gui を実行してください。\n"
-            'For pip: python -m pip install ".[gui]"',
+            "起動コマンド: uv run ni-spl",
             file=sys.stderr,
         )
         return 2

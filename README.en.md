@@ -19,22 +19,22 @@ Use Git, Python 3.11 or later, and [uv](https://docs.astral.sh/uv/). Clone the r
 git clone https://github.com/kmraven/ni-spl-calibration.git
 cd ni-spl-calibration
 uv sync --locked --extra gui --extra daq
-uv run python -m ni_spl_calibration
+uv run ni-spl
 ```
 
 Physical hardware also requires the **NI-DAQmx driver** appropriate for your DAQ model and operating system. Installing the Python package alone is insufficient. See the [official NI documentation](https://nidaqmx-python.readthedocs.io/en/stable/). The hardware backend targets Windows/Linux environments supported by the driver.
 
-For pip, run `python -m pip install ".[gui,daq]"` from the repository root. The repository includes `uv.lock` so uv can reproduce the dependency versions. API-only installations can omit the `gui` extra.
+The repository includes `uv.lock` so uv can reproduce the dependency versions. API-only installations can omit the `gui` extra.
 
 ## Desktop GUI
 
-**Launch the desktop GUI with Python.** Use the Python interpreter from the virtual environment where the package is installed:
+**Launch the desktop GUI with uv.** Run this from the repository root:
 
 ```sh
-python -m ni_spl_calibration
+uv run ni-spl
 ```
 
-If uv manages your environment, run `uv run python -m ni_spl_calibration` from the repository root.
+Before the first launch, install the dependencies with `uv sync --locked --extra gui --extra daq` as shown above.
 
 The interface uses Japanese labels and starts in **simulation mode**. Select `NI DAQ 実機` at the top right for physical hardware.
 
