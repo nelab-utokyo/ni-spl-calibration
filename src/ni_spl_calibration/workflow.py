@@ -30,6 +30,7 @@ class StimulusSource:
     kind: str
     location: str
     parameters: Path | None = None
+    wav_channel_mode: str = "mono"
 
     def prepare(self, sample_rate_hz: int | None = None):
         if self.parameters and self.kind != "generator":
@@ -37,7 +38,9 @@ class StimulusSource:
         if not self.location.strip():
             raise ValueError("Select a waveform or generator first")
         if self.kind == "wav":
-            return load_wav(self.location, sample_rate_hz=sample_rate_hz)
+            return load_wav(
+                self.location, sample_rate_hz=sample_rate_hz, channel_mode=self.wav_channel_mode
+            )
         if self.kind == "npz":
             stimulus = load_stimulus(self.location)
             if sample_rate_hz is not None and stimulus.sample_rate_hz != sample_rate_hz:
@@ -97,7 +100,7 @@ def require_new_output(path: Path):
         raise FileExistsError(f"Output already exists: {path}")
 
 
-def measure_reference_to_file(setup, output, *, simulate, cancel_requested=None):
+def measure_reference_to_file(setup, output, *, simulate, cancel_requested=None, on_samples=None):
     output = Path(output)
     require_new_output(output)
     if cancel_requested is not None and cancel_requested():
@@ -106,6 +109,7 @@ def measure_reference_to_file(setup, output, *, simulate, cancel_requested=None)
         setup,
         hardware=make_hardware(setup, simulate=simulate, reference_mode=True),
         cancel_requested=cancel_requested,
+        on_samples=on_samples,
     )
     write_json(output, reference)
     return reference
@@ -122,6 +126,7 @@ def calibrate_to_directory(
     on_iteration=None,
     cancel_requested=None,
     parent_run=None,
+    on_samples=None,
 ):
     output = Path(output)
     require_new_output(output)
@@ -151,6 +156,7 @@ def calibrate_to_directory(
             hardware=hardware,
             on_iteration=on_iteration,
             cancel_requested=cancel_requested,
+            on_samples=on_samples,
         )
     except (Exception, KeyboardInterrupt) as error:
         write_json(

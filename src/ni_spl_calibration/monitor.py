@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -11,6 +10,7 @@ import numpy as np
 
 from .analysis import band_power
 from .calibration import MeasurementCancelled, timestamp, validate_reference
+from .meter import input_metrics
 from .records import file_sha256
 from .storage import write_json
 from .workflow import make_hardware, require_new_output
@@ -66,27 +66,11 @@ def monitor_input(
                     values = np.asarray(values, dtype=float)
                     if values.shape != (block_size,) or not np.all(np.isfinite(values)):
                         raise ValueError("Invalid microphone monitor capture")
-                    power = band_power(values, setup.daq.sample_rate_hz, settings)
-                    clipped = bool(
-                        np.min(values)
-                        <= setup.daq.input_min_v * setup.measurement.input_clip_fraction
-                        or np.max(values)
-                        >= setup.daq.input_max_v * setup.measurement.input_clip_fraction
-                    )
-                    level = (
-                        20 * math.log10(math.sqrt(power) / reference.sensitivity_v_per_pa / 20e-6)
-                        if reference is not None and power > 0 and not clipped
-                        else None
-                    )
                     item = {
                         "at": timestamp(),
                         "first_sample": count * block_size,
                         "sample_count": block_size,
-                        "rms_v": float(np.sqrt(np.mean(values**2))),
-                        "peak_v": float(np.max(np.abs(values))),
-                        "level_spl_db": level,
-                        "clipped": clipped,
-                        "calibrated": reference is not None,
+                        **input_metrics(values, setup, reference),
                     }
                     count += 1
                     if save_capture:

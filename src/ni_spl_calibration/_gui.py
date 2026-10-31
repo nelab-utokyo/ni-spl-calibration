@@ -35,8 +35,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSlider,
     QTableWidget,
-    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -49,7 +49,20 @@ from .calibration import (
     validate_reference,
 )
 from .config import DaqSettings, MeasurementSettings, Setup, load_setup
+from .i18n import (
+    Message,
+    bind,
+    error_message,
+    retranslate,
+    set_cell,
+    set_headers,
+    set_text,
+    set_value,
+    translate,
+)
+from .meter import LiveMeter
 from .monitor import monitor_input
+from .playback import VolumeControl, run_test_playback
 from .records import ActivityLog, file_sha256, find_runs, load_replay
 from .workflow import (
     StimulusSource,
@@ -97,7 +110,8 @@ QProgressBar::chunk { background: #327aba; border-radius: 4px; }
 
 
 def label(text, *, muted=False):
-    widget = QLabel(text)
+    widget = QLabel()
+    set_text(widget, text)
     widget.setWordWrap(True)
     widget.setTextFormat(Qt.TextFormat.PlainText)
     if muted:
@@ -106,7 +120,8 @@ def label(text, *, muted=False):
 
 
 def button(text, callback, *, primary=False):
-    widget = QPushButton(text)
+    widget = QPushButton()
+    set_text(widget, text)
     widget.clicked.connect(callback)
     if primary:
         widget.setObjectName("primary")
@@ -150,9 +165,11 @@ class TargetInput(QLineEdit):
         try:
             value = float(self.text())
         except ValueError as error:
-            raise ValueError("目標音圧には数値を入力してください。") from error
+            raise ValueError(translate(self, "目標音圧には数値を入力してください。")) from error
         if not math.isfinite(value) or not -100 <= value <= 180:
-            raise ValueError("目標音圧は−100〜180 dB SPLの有限値で指定してください。")
+            raise ValueError(
+                translate(self, "目標音圧は−100〜180 dB SPLの有限値で指定してください。")
+            )
         return value
 
     def setValue(self, value):
@@ -192,8 +209,10 @@ class SetupEditor(QScrollArea):
                 ],
             )
         )
-        self.fields["daq.sample_rate_hz"].setToolTip(
-            "DAQのAI/AO、WAVの変換先、生成関数に共通で使います。変更後は再基準測定が必要です。"
+        bind(
+            self.fields["daq.sample_rate_hz"],
+            "setToolTip",
+            "DAQのAI/AO、WAVの変換先、生成関数に共通で使います。変更後は再基準測定が必要です。",
         )
         layout.addWidget(
             label(
@@ -244,16 +263,19 @@ class SetupEditor(QScrollArea):
                 ],
             )
         )
-        self.fields["measurement.band_hz"].setPlaceholderText("例: [5000, 80000]")
-        self.fields["measurement.frequency_correction_db"].setPlaceholderText(
-            "例: [[0, 0], [1000, 0], [100000, -2.0]]"
+        bind(self.fields["measurement.band_hz"], "setPlaceholderText", "例: [5000, 80000]")
+        bind(
+            self.fields["measurement.frequency_correction_db"],
+            "setPlaceholderText",
+            "例: [[0, 0], [1000, 0], [100000, -2.0]]",
         )
         layout.addStretch()
         self.setWidget(content)
         self.set_setup(new_setup())
 
     def _section(self, title, specs):
-        group = QGroupBox(title)
+        group = QGroupBox()
+        bind(group, "setTitle", title)
         form = QFormLayout(group)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
@@ -271,7 +293,7 @@ class SetupEditor(QScrollArea):
                 widget = QLineEdit()
                 widget.textChanged.connect(lambda *_: self.changed.emit())
             widget.setObjectName(key)
-            form.addRow(title, widget)
+            form.addRow(label(title), widget)
             self.fields[key] = widget
             self.types[key] = kind
         return group
@@ -315,7 +337,9 @@ class SetupEditor(QScrollArea):
                 else:
                     value = text
             except (ValueError, TypeError) as error:
-                raise ValueError(f"{key}: 入力値を確認してください") from error
+                raise ValueError(
+                    translate(self, "{key}: 入力値を確認してください", key=key)
+                ) from error
             if "." in key:
                 section, name = key.split(".")
                 payload[section][name] = value
@@ -327,8 +351,9 @@ class SetupEditor(QScrollArea):
 
 
 class WaveformView(QWidget):
-    def __init__(self):
+    def __init__(self, *, empty_text="波形を選択すると、ここに表示します"):
         super().__init__()
+        self.empty_text = empty_text
         self.stimulus = None
         self.setMinimumHeight(135)
         self.samples = None
@@ -365,7 +390,9 @@ class WaveformView(QWidget):
         painter.drawText(QPointF(2, area.bottom()), f"{-self.axis_peak:.2g}")
         if self.samples is None:
             painter.drawText(
-                area, Qt.AlignmentFlag.AlignCenter, "波形を選択すると、ここに表示します"
+                area,
+                Qt.AlignmentFlag.AlignCenter,
+                translate(self, self.empty_text),
             )
             return
         samples = self.samples
@@ -383,6 +410,81 @@ class WaveformView(QWidget):
         painter.drawText(QPointF(area.left(), self.height() - 6), "0 s")
         duration = len(samples) / self.sample_rate_hz
         painter.drawText(QPointF(area.right() - 90, self.height() - 6), f"{duration:.3f} s")
+
+
+class SpectrumView(QWidget):
+    """Log-frequency RMS bars; display only, with no filtering of AO samples."""
+
+    def __init__(self):
+        super().__init__()
+        self.spectrum = None
+        self.peaks = None
+        self.setMinimumHeight(210)
+
+    def set_spectrum(self, spectrum):
+        self.spectrum = spectrum
+        levels = np.asarray(spectrum["levels_dbv"], dtype=float)
+        if self.peaks is None or len(self.peaks) != len(levels):
+            self.peaks = levels.copy()
+        else:
+            self.peaks = np.maximum(levels, self.peaks - 2)
+        self.update()
+
+    def clear(self):
+        self.spectrum = None
+        self.peaks = None
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        area = QRectF(48, 24, max(1, self.width() - 66), max(1, self.height() - 60))
+        painter.fillRect(area, QColor("#132637"))
+        low, high = -120.0, 20.0
+        for level in range(-120, 21, 20):
+            y = area.bottom() - (level - low) / (high - low) * area.height()
+            painter.setPen(QColor("#304657"))
+            painter.drawLine(QPointF(area.left(), y), QPointF(area.right(), y))
+            painter.setPen(QColor("#64748b"))
+            painter.drawText(QPointF(1, y + 4), str(level))
+        painter.drawText(
+            QPointF(area.left(), 15), translate(self, "マイク入力スペクトラム [dBV RMS]")
+        )
+        if self.spectrum is None:
+            painter.setPen(QColor("#d5e5f3"))
+            painter.drawText(
+                area,
+                Qt.AlignmentFlag.AlignCenter,
+                translate(self, "モニターまたはテスト再生を開始してください"),
+            )
+            return
+        levels = np.clip(self.spectrum["levels_dbv"], low, high)
+        width = area.width() / len(levels)
+        for index, level in enumerate(levels):
+            x = area.left() + index * width + 1
+            y = area.bottom() - (level - low) / (high - low) * area.height()
+            painter.fillRect(QRectF(x, y, max(1, width - 2), area.bottom() - y), QColor("#35b9ae"))
+            peak = np.clip(self.peaks[index], low, high)
+            peak_y = area.bottom() - (peak - low) / (high - low) * area.height()
+            painter.setPen(QPen(QColor("#99ece1"), 2))
+            painter.drawLine(QPointF(x, peak_y), QPointF(x + max(1, width - 2), peak_y))
+        edges = np.asarray(self.spectrum["edges_hz"])
+        last_right = -1
+        painter.setPen(QColor("#64748b"))
+        for frequency in (20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000):
+            if not edges[0] <= frequency <= edges[-1] * (1 + 1e-12):
+                continue
+            x = (
+                area.left()
+                + np.log(frequency / edges[0]) / np.log(edges[-1] / edges[0]) * area.width()
+            )
+            text = f"{frequency // 1000}k" if frequency >= 1000 else str(frequency)
+            text_width = painter.fontMetrics().horizontalAdvance(text)
+            left = min(max(area.left(), x - text_width / 2), area.right() - text_width)
+            if left > last_right + 10:
+                painter.drawText(QPointF(left, area.bottom() + 19), text)
+                last_right = left + text_width
+        painter.drawText(QPointF(area.right() - 18, self.height() - 1), "Hz")
 
 
 class Operation(QThread):
@@ -416,6 +518,7 @@ class CalibrationWindow(QMainWindow):
         self._closing = False
         self.activity = ActivityLog()
         self._parent_run = None
+        self.volume_control = VolumeControl(0.1)
         content = QWidget()
         self.setCentralWidget(content)
         layout = QVBoxLayout(content)
@@ -425,9 +528,17 @@ class CalibrationWindow(QMainWindow):
         title.setObjectName("title")
         self.mode = QComboBox()
         self.mode.addItems(["シミュレーション", "NI DAQ 実機"])
+        bind(self.mode, "setItemText", "シミュレーション", 0)
+        bind(self.mode, "setItemText", "NI DAQ 実機", 1)
+        self.mode.setCurrentIndex(1)
         self.mode.setMinimumWidth(190)
         self.mode.setMaximumWidth(240)
-        layout.addWidget(row(title, self.mode))
+        self.language = QComboBox()
+        self.language.setObjectName("languageSelector")
+        self.language.addItem("日本語", "ja")
+        self.language.addItem("English", "en")
+        self.language.setMaximumWidth(135)
+        layout.addWidget(row(title, self.mode, label("言語 / Language"), self.language))
         layout.addWidget(label("設定 → マイク基準測定 → 波形の音圧校正", muted=True))
         self.banner = label("")
         self.banner.setObjectName("banner")
@@ -447,6 +558,7 @@ class CalibrationWindow(QMainWindow):
         self._waveform_tab()
         self._history_tab()
         self._monitor_tab()
+        self._playback_tab()
         self.progress = QProgressBar()
         self.progress.setTextVisible(False)
         self.progress.setRange(0, 1)
@@ -465,13 +577,23 @@ class CalibrationWindow(QMainWindow):
         self.function_name.textChanged.connect(self._source_changed)
         self.parameters_path.textChanged.connect(self._source_changed)
         self.target.valueChanged.connect(self._target_changed)
+        self.wav_channels.currentIndexChanged.connect(self._source_changed)
+        self.language.currentIndexChanged.connect(self._language_changed)
         self._source_changed()
         self._mode_changed()
         self._scan_history()
+        self._language_changed()
 
     @property
     def simulate(self):
         return self.mode.currentIndex() == 0
+
+    @Slot()
+    def _language_changed(self):
+        retranslate(self)
+        self.waveform.update()
+        self.monitor_spectrum.update()
+        self.playback_spectrum.update()
 
     def _page(self, title, *, scroll=False):
         page = QWidget()
@@ -487,6 +609,7 @@ class CalibrationWindow(QMainWindow):
             self.tabs.addTab(area, title)
         else:
             self.tabs.addTab(page, title)
+        bind(self.tabs, "setTabText", title, self.tabs.count() - 1)
         return layout
 
     def _settings_tab(self):
@@ -540,9 +663,11 @@ class CalibrationWindow(QMainWindow):
         layout.addWidget(self.shared_rate)
         self.source_kind = QComboBox()
         self.source_kind.addItems(["WAVファイル", "保存波形 (NPZ)", "Python生成関数"])
+        for index, source in enumerate(["WAVファイル", "保存波形 (NPZ)", "Python生成関数"]):
+            bind(self.source_kind, "setItemText", source, index)
         self.source_kind.setMaximumWidth(180)
         self.source_location = QLineEdit()
-        self.source_location.setPlaceholderText("再生するモノラルWAVを選択してください")
+        bind(self.source_location, "setPlaceholderText", "再生するモノラルWAVを選択してください")
         layout.addWidget(
             row(
                 self.source_kind,
@@ -558,7 +683,11 @@ class CalibrationWindow(QMainWindow):
         )
         layout.addWidget(self.generator_row)
         self.parameters_path = QLineEdit()
-        self.parameters_path.setPlaceholderText("省略可。生成関数の引数YAML（SRは設定画面で指定）")
+        bind(
+            self.parameters_path,
+            "setPlaceholderText",
+            "省略可。生成関数の引数YAML（SRは設定画面で指定）",
+        )
         self.parameters_row = row(
             label("パラメータ"), self.parameters_path, button("YAMLを選択", self._choose_parameters)
         )
@@ -587,9 +716,7 @@ class CalibrationWindow(QMainWindow):
         peak_card, self.peak_value = metric("出力ピーク [V]")
         layout.addWidget(row(level_card, scale_card, peak_card))
         self.iterations = QTableWidget(0, 4)
-        self.iterations.setHorizontalHeaderLabels(
-            ["探索回", "実測音圧 [dB SPL]", "出力ピーク [V]", "誤差 [dB]"]
-        )
+        set_headers(self.iterations, ["探索回", "実測音圧 [dB SPL]", "出力ピーク [V]", "誤差 [dB]"])
         self.iterations.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.iterations.verticalHeader().hide()
         self.iterations.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -602,12 +729,23 @@ class CalibrationWindow(QMainWindow):
         self.open_result_button = button("結果フォルダを開く", self._open_result)
         self.open_result_button.setMaximumWidth(180)
         self.open_result_button.setEnabled(False)
-        layout.addWidget(row(self.result_file, self.open_result_button))
+        layout.addWidget(
+            row(
+                self.result_file,
+                self.open_result_button,
+                button("テスト再生へ →", lambda: self.tabs.setCurrentIndex(5)),
+            )
+        )
 
     def _show_error(self, error):
-        details = "\n".join([str(error), *getattr(error, "__notes__", [])])
-        self.status.setText(f"エラー: {details}")
-        QMessageBox.warning(self, "処理を完了できませんでした", details)
+        notes = "".join(f"\n{note}" for note in getattr(error, "__notes__", []))
+        details = Message("{error}{notes}", {"error": error_message(error), "notes": notes})
+        set_text(self.status, "エラー: {details}", details=details)
+        QMessageBox.warning(
+            self,
+            translate(self, "処理を完了できませんでした"),
+            translate(self, "{details}", details=details),
+        )
 
     def _history_tab(self):
         layout = self._page("4  履歴・再現")
@@ -629,8 +767,8 @@ class CalibrationWindow(QMainWindow):
             )
         )
         self.history = QTableWidget(0, 5)
-        self.history.setHorizontalHeaderLabels(
-            ["実施日時 (UTC)", "状態", "目標 [dB SPL]", "測定モード", "保存フォルダ"]
+        set_headers(
+            self.history, ["実施日時 (UTC)", "状態", "目標 [dB SPL]", "測定モード", "保存フォルダ"]
         )
         self.history.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
@@ -667,11 +805,16 @@ class CalibrationWindow(QMainWindow):
                     record["directory"].name,
                 ]
                 for column, value in enumerate(values):
-                    item = QTableWidgetItem(value)
+                    item = (
+                        set_cell(self.history, index, column, value)
+                        if column in (1, 3)
+                        else set_cell(self.history, index, column, "{value}", value=value)
+                    )
                     item.setData(Qt.ItemDataRole.UserRole, str(record["directory"]))
-                    self.history.setItem(index, column, item)
-            self.history_info.setText(
-                f"{len(records)}件の実行記録。復元時にファイルのSHA-256を照合します。"
+            set_text(
+                self.history_info,
+                "{count}件の実行記録。復元時にファイルのSHA-256を照合します。",
+                count=len(records),
             )
 
         self._guard(scan)
@@ -679,13 +822,13 @@ class CalibrationWindow(QMainWindow):
     def _restore_selected(self):
         index = self.history.currentRow()
         if index < 0:
-            self.status.setText("復元する実行記録を選択してください。")
+            set_text(self.status, "復元する実行記録を選択してください。")
             return
         self._restore(self.history.item(index, 0).data(Qt.ItemDataRole.UserRole))
 
     def _choose_replay(self):
         path = QFileDialog.getExistingDirectory(
-            self, "実行記録のフォルダを選択", self.output_root.text()
+            self, translate(self, "実行記録のフォルダを選択"), self.output_root.text()
         )
         if path:
             self._restore(path)
@@ -703,7 +846,9 @@ class CalibrationWindow(QMainWindow):
 
     def _monitor_tab(self):
         layout = self._page("5  マイクモニター", scroll=True)
-        layout.addWidget(label("マイク入力を約100 msごとに更新します。AOは0 Vに保ちます。"))
+        layout.addWidget(
+            label("マイク入力を周波数ごとのバーで表示します。通常のモニター中はAOを0 Vに保ちます。")
+        )
         layout.addWidget(
             label(
                 "有効な基準記録があれば、設定帯域の総音圧を表示します（背景音を含みます）。"
@@ -713,6 +858,7 @@ class CalibrationWindow(QMainWindow):
         )
         self.monitor_start = button("モニターを開始", self._start_monitor, primary=True)
         self.save_monitor = QCheckBox("生のマイク入力も保存する (NPZ)")
+        set_text(self.save_monitor, "生のマイク入力も保存する (NPZ)")
         self.save_monitor.setChecked(True)
         layout.addWidget(row(self.monitor_start, self.save_monitor))
         self.monitor_status = label("停止中。基準がなくても電圧波形を確認できます。", muted=True)
@@ -721,10 +867,14 @@ class CalibrationWindow(QMainWindow):
         peak_card, self.monitor_peak = metric("入力ピーク [V]")
         level_card, self.monitor_level = metric("総音圧 [dB SPL]")
         layout.addWidget(row(rms_card, peak_card, level_card))
-        layout.addWidget(label("マイク入力の直近1秒 [V] · 縦軸は自動スケール", muted=True))
-        self.monitor_waveform = WaveformView()
-        self.monitor_waveform.setMinimumHeight(220)
-        layout.addWidget(self.monitor_waveform, 1)
+        layout.addWidget(
+            label(
+                "横軸は周波数（対数）、縦軸は帯域RMSのdBVです。音声を加工する機能ではありません。",
+                muted=True,
+            )
+        )
+        self.monitor_spectrum = SpectrumView()
+        layout.addWidget(self.monitor_spectrum, 1)
         self.monitor_file = label(
             "開始・停止・電圧・音圧の時系列は保存フォルダに記録します。", muted=True
         )
@@ -750,9 +900,14 @@ class CalibrationWindow(QMainWindow):
             output = self._output_path("monitor")
             self.monitor_samples = np.empty(0)
             self.monitor_duration_s = 0
-            self.monitor_level.setText("—" if reference is not None else "未校正")
-            self.monitor_status.setText(f"モニター中 · 共通SR: {setup.daq.sample_rate_hz:,} Hz")
-            self.monitor_file.setText(str(output))
+            self.monitor_spectrum.clear()
+            set_text(self.monitor_level, "—" if reference is not None else "未校正")
+            set_text(
+                self.monitor_status,
+                "モニター中 · 共通SR: {rate:,} Hz",
+                rate=setup.daq.sample_rate_hz,
+            )
+            set_value(self.monitor_file, str(output))
             self.job_output = output
             self._start(
                 "monitor",
@@ -773,26 +928,230 @@ class CalibrationWindow(QMainWindow):
         rate = item["sample_rate_hz"]
         self.monitor_samples = np.concatenate((self.monitor_samples, item["samples"]))[-rate:]
         self.monitor_duration_s = item["duration_s"]
-        self.monitor_waveform.set_input(self.monitor_samples, rate)
-        self.monitor_rms.setText(f"{item['rms_v']:.5g}")
-        self.monitor_peak.setText(f"{item['peak_v']:.5g}")
+        self.monitor_spectrum.set_spectrum(item["spectrum"])
+        set_value(self.monitor_rms, f"{item['rms_v']:.5g}")
+        set_value(self.monitor_peak, f"{item['peak_v']:.5g}")
         level = item["level_spl_db"]
-        self.monitor_level.setText(
-            "未校正" if not item["calibrated"] else "無信号" if level is None else f"{level:.2f}"
+        set_text(
+            self.monitor_level,
+            "未校正" if not item["calibrated"] else "無信号" if level is None else f"{level:.2f}",
         )
+        if item.get("level_note"):
+            set_text(self.monitor_level, "帯域計算不可")
         if item["clipped"]:
-            self.monitor_status.setText(
-                "入力クリッピング：入力範囲・コンディショナのゲインを確認してください。"
+            set_text(
+                self.monitor_status,
+                "入力クリッピング：入力範囲・コンディショナのゲインを確認してください。",
             )
             self.monitor_status.setStyleSheet("color: #a73338;")
-            self.monitor_level.setText("クリップ")
+            set_text(self.monitor_level, "クリップ")
         else:
-            self.monitor_status.setText(f"モニター中 · {item['duration_s']:.1f} s · {rate:,} Hz")
+            set_text(
+                self.monitor_status,
+                "モニター中 · {duration:.1f} s · {rate:,} Hz",
+                duration=item["duration_s"],
+                rate=rate,
+            )
             self.monitor_status.setStyleSheet("")
+
+    def _playback_tab(self):
+        layout = self._page("6  テスト再生", scroll=True)
+        layout.addWidget(
+            label("選択した音声をAOから再生し、マイク入力を同時に確認します。基準記録は不要です。")
+        )
+        self.playback_source = label("再生する音声を選択してください。", muted=True)
+        layout.addWidget(
+            row(
+                self.playback_source,
+                button("音声を選択", self._choose_test_source),
+                button("1 kHzテスト音を選択", self._choose_test_tone),
+            )
+        )
+        self.wav_channels = QComboBox()
+        for source, mode in [
+            ("モノラルのみ", "mono"),
+            ("左右平均 (L+R)/2", "mix"),
+            ("左チャンネル L", "left"),
+            ("右チャンネル R", "right"),
+        ]:
+            index = self.wav_channels.count()
+            self.wav_channels.addItem(source, mode)
+            bind(self.wav_channels, "setItemText", source, index)
+        self.wav_channels.setCurrentIndex(1)
+        layout.addWidget(row(label("WAVチャンネル処理"), self.wav_channels))
+        self.playback_channel_info = label("AO 1 ch / モノラル波形", muted=True)
+        layout.addWidget(self.playback_channel_info)
+        self.playback_file_info = label(
+            "WAV・NPZを選ぶか、波形校正画面で生成関数を指定してください。", muted=True
+        )
+        layout.addWidget(self.playback_file_info)
+        self.playback_hardware = label(
+            "接続機種・AOチャンネル・指令電圧を再生時に表示します。", muted=True
+        )
+        layout.addWidget(self.playback_hardware)
+        self.playback_start = button("テスト再生を開始", self._test_playback, primary=True)
+        self.playback_stop = button("再生停止", self._request_stop)
+        self.playback_stop.setEnabled(False)
+        self.loop_audio = QCheckBox()
+        set_text(self.loop_audio, "繰り返し再生")
+        self.loop_audio.setChecked(True)
+        self.save_playback = QCheckBox()
+        set_text(self.save_playback, "AO・マイクの生データを保存")
+        self.save_playback.setChecked(True)
+        self.mute_button = button("ミュート", lambda: self.volume_fader.setValue(0))
+        layout.addWidget(
+            row(
+                self.playback_start,
+                self.playback_stop,
+                self.mute_button,
+                self.loop_audio,
+                self.save_playback,
+            )
+        )
+        self.volume_fader = QSlider(Qt.Orientation.Vertical)
+        self.volume_fader.setRange(0, 1000)
+        self.volume_fader.setValue(100)
+        self.volume_fader.setMinimumHeight(150)
+        self.volume_fader.setMaximumWidth(55)
+        self.volume_fader.valueChanged.connect(self._volume_changed)
+        self.volume_text = label("")
+        fader_panel = QWidget()
+        fader_layout = QVBoxLayout(fader_panel)
+        fader_layout.addWidget(label("音量フェーダー"))
+        fader_layout.addWidget(self.volume_text)
+        fader_layout.addWidget(self.volume_fader, 1, Qt.AlignmentFlag.AlignHCenter)
+        fader_panel.setMaximumWidth(210)
+        self.playback_spectrum = SpectrumView()
+        layout.addWidget(row(fader_panel, self.playback_spectrum), 1)
+        layout.addWidget(
+            label("100%は設定したVpeak上限です。校正済み音圧の指定ではありません。", muted=True)
+        )
+        rms, self.playback_rms = metric("入力RMS [V]")
+        spl, self.playback_spl = metric("総音圧 [dB SPL]")
+        command, self.playback_peak = metric("AO指令ピーク [V]")
+        layout.addWidget(row(rms, spl, command))
+        self.playback_status = label("停止中。音声を選択して再生を開始してください。", muted=True)
+        layout.addWidget(self.playback_status)
+        self.playback_open = button("記録フォルダを開く", self._open_monitor)
+        self.playback_open.setEnabled(False)
+        layout.addWidget(self.playback_open)
+        self._volume_changed()
+
+    def _volume_changed(self):
+        fraction = self.volume_fader.value() / 1000
+        self.volume_control.set(fraction)
+        try:
+            peak = self.editor.setup().daq.max_peak_v * fraction
+        except (ValueError, TypeError):
+            peak = 0.0
+        set_text(
+            self.volume_text,
+            "{volume:.1f}%\n上限 {peak:.6g} Vpeak",
+            volume=fraction * 100,
+            peak=peak,
+        )
+
+    def _choose_test_source(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, translate(self, "テスト再生する音声を選択"), "", "Audio (*.wav *.npz)"
+        )
+        if path:
+            self.source_kind.setCurrentIndex(1 if Path(path).suffix.lower() == ".npz" else 0)
+            self.source_location.setText(path)
+            self._prepare(playback_preview=True)
+
+    def _choose_test_tone(self):
+        self.parameters_path.clear()
+        self.function_name.setText("make_test_tone")
+        self.source_kind.setCurrentIndex(2)
+        self.source_location.setText("ni_spl_calibration.playback")
+        self._prepare(playback_preview=True)
+
+    def _test_playback(self):
+        self.tabs.setCurrentIndex(5)
+        if self.stimulus is None:
+            self._prepare(then_playback=True)
+            return
+
+        def start():
+            setup = self.editor.setup()
+            stimulus, simulate = self.stimulus, self.simulate
+            if not self._confirm_hardware(setup):
+                return
+            reference = self.reference
+            if reference is not None:
+                try:
+                    validate_reference(setup, reference)
+                    self._check_backend(reference)
+                except ValueError:
+                    reference = None
+            loop, save_capture = self.loop_audio.isChecked(), self.save_playback.isChecked()
+            output = self._output_path("playback")
+            self.job_output = output
+            self.playback_spectrum.clear()
+            set_value(self.playback_peak, "—")
+            self._start(
+                "test_playback",
+                lambda cancelled, progress: run_test_playback(
+                    stimulus,
+                    setup=setup,
+                    output=output,
+                    simulate=simulate,
+                    volume=self.volume_control,
+                    loop=loop,
+                    reference=reference,
+                    save_capture=save_capture,
+                    cancel_requested=cancelled,
+                    on_frame=progress,
+                ),
+            )
+            area = self.tabs.widget(5)
+            if isinstance(area, QScrollArea):
+                area.ensureWidgetVisible(self.volume_fader, 0, 20)
+
+        self._guard(start)
+
+    def _hardware_info(self, description):
+        product = description.get("product_type", description.get("model", description["backend"]))
+        setup = self.editor.setup()
+        set_text(
+            self.playback_hardware,
+            "接続: {product}\nAI {input} / AO {output} / {rate:,} Hz / 出力上限 {limit:g} Vpeak",
+            product=product,
+            input=setup.daq.input_channel,
+            output=setup.daq.output_channel,
+            rate=setup.daq.sample_rate_hz,
+            limit=setup.daq.max_peak_v,
+        )
+
+    def _playback_frame(self, item):
+        self._monitor_frame(item)
+        self.playback_spectrum.set_spectrum(item["spectrum"])
+        set_value(self.playback_rms, self.monitor_rms.text())
+        set_text(
+            self.playback_spl,
+            "クリップ"
+            if item["clipped"]
+            else "未校正"
+            if not item["calibrated"]
+            else "帯域計算不可"
+            if item.get("level_note")
+            else "無信号"
+            if item["level_spl_db"] is None
+            else f"{item['level_spl_db']:.2f}",
+        )
+        set_value(self.playback_peak, f"{item['output_peak_v']:.6g}")
+        self._hardware_info(item["hardware"])
+        set_text(
+            self.playback_status,
+            "再生中 · {duration:.2f} s · 音量 {volume:.1f}%",
+            duration=item["duration_s"],
+            volume=item["volume_fraction"] * 100,
+        )
 
     def _apply_replay(self, replay):
         self.editor.set_setup(replay.setup)
-        self.setup_path.setText(str(replay.directory / "setup.json"))
+        set_value(self.setup_path, str(replay.directory / "setup.json"))
         self.mode.setCurrentIndex(0 if replay.backend == "simulation" else 1)
         self.source_kind.setCurrentIndex(1)
         self.source_location.setText(str(replay.directory / "stimulus.npz"))
@@ -802,14 +1161,17 @@ class CalibrationWindow(QMainWindow):
         self._parent_run = replay.parent_record
         self.tabs.setCurrentIndex(2)
         self._refresh()
-        self.status.setText(
-            "条件を復元しました。設定・機器・測定位置を確認し、「校正を開始」で再測定できます。"
+        set_text(
+            self.status,
+            "条件を復元しました。設定・機器・測定位置を確認し、「校正を開始」で再測定できます。",
         )
 
     def _audit(self, action, **details):
         root = self.output_root.text().strip()
         if not root:
-            raise ValueError("操作を記録するため、保存フォルダを指定してください。")
+            raise ValueError(
+                translate(self, "操作を記録するため、保存フォルダを指定してください。")
+            )
         return self.activity.record(root, action, **details)
 
     def _context(self):
@@ -835,20 +1197,27 @@ class CalibrationWindow(QMainWindow):
             "setup": setup,
             "reference": asdict(self.reference) if self.reference else None,
             "backend": "simulation" if self.simulate else "ni-daqmx",
+            "ui_language": self.language.currentData(),
             "target_spl_db": target,
             "source": {
                 "kind": source.kind,
                 "location": source.location,
                 "parameters": str(source.parameters) if source.parameters else None,
+                "wav_channel_mode": source.wav_channel_mode,
             },
             "parent_run": self._parent_run,
+            "test_playback": {
+                "volume_fraction": self.volume_control.get(),
+                "loop": self.loop_audio.isChecked(),
+                "save_capture": self.save_playback.isChecked(),
+            },
         }
 
     def _open_activity(self):
         if self.activity.directory is not None:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.activity.directory)))
         else:
-            self.status.setText("測定・波形確認などの操作を行うと、操作ログを保存します。")
+            set_text(self.status, "測定・波形確認などの操作を行うと、操作ログを保存します。")
 
     def _guard(self, task):
         try:
@@ -858,17 +1227,21 @@ class CalibrationWindow(QMainWindow):
             return None
 
     def _choose_output(self):
-        path = QFileDialog.getExistingDirectory(self, "結果の保存フォルダ", self.output_root.text())
+        path = QFileDialog.getExistingDirectory(
+            self, translate(self, "結果の保存フォルダ"), self.output_root.text()
+        )
         if path:
             self.output_root.setText(path)
 
     def _new_setup(self):
         self._parent_run = None
-        self.setup_path.setText("新規セットアップ")
+        set_text(self.setup_path, "新規セットアップ")
         self.editor.set_setup(new_setup())
 
     def _load_setup(self):
-        path, _ = QFileDialog.getOpenFileName(self, "設定を読み込む", "", "YAML (*.yaml *.yml)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, translate(self, "設定を読み込む"), "", "YAML (*.yaml *.yml)"
+        )
         if path:
 
             def load():
@@ -878,8 +1251,8 @@ class CalibrationWindow(QMainWindow):
                 )
                 self._parent_run = None
                 self.editor.set_setup(setup)
-                self.setup_path.setText(path)
-                self.status.setText("設定を読み込みました。")
+                set_value(self.setup_path, path)
+                set_text(self.status, "設定を読み込みました。")
 
             self._guard(load)
 
@@ -888,7 +1261,7 @@ class CalibrationWindow(QMainWindow):
         if setup is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "設定を保存", "my-setup.yaml", "YAML (*.yaml *.yml)"
+            self, translate(self, "設定を保存"), "my-setup.yaml", "YAML (*.yaml *.yml)"
         )
         if path:
 
@@ -900,14 +1273,14 @@ class CalibrationWindow(QMainWindow):
                 self._audit(
                     "setup_saved", path=path, file_sha256=file_sha256(path), setup=asdict(setup)
                 )
-                self.setup_path.setText(path)
-                self.status.setText("設定を保存しました。")
+                set_value(self.setup_path, path)
+                set_text(self.status, "設定を保存しました。")
 
             self._guard(save)
 
     def _load_reference(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "基準記録を読み込む", self.output_root.text(), "JSON (*.json)"
+            self, translate(self, "基準記録を読み込む"), self.output_root.text(), "JSON (*.json)"
         )
         if path:
 
@@ -917,32 +1290,35 @@ class CalibrationWindow(QMainWindow):
                 self._check_backend(reference)
                 self._audit("reference_loaded", path=path, reference=asdict(reference))
                 self._set_reference(reference, Path(path))
-                self.status.setText("基準記録を読み込みました。波形校正へ進めます。")
+                set_text(self.status, "基準記録を読み込みました。波形校正へ進めます。")
 
             self._guard(load)
 
     def _set_reference(self, reference, path):
         self._clear_results()
         self.reference = reference
-        self.reference_file.setText(f"{reference.measured_at}\n{path}")
-        self.sensitivity_value.setText(f"{reference.sensitivity_v_per_pa:.6g}")
-        self.frequency_value.setText(f"{reference.estimated_frequency_hz:.2f}")
-        self.stability_value.setText(f"{reference.block_span_db:.3f}")
+        set_value(self.reference_file, f"{reference.measured_at}\n{path}")
+        set_value(self.sensitivity_value, f"{reference.sensitivity_v_per_pa:.6g}")
+        set_value(self.frequency_value, f"{reference.estimated_frequency_hz:.2f}")
+        set_value(self.stability_value, f"{reference.block_span_db:.3f}")
         self._refresh()
 
     def _check_backend(self, reference):
         backend = "simulation" if self.simulate else "ni-daqmx"
         if reference.hardware.get("backend") != backend:
             raise ValueError(
-                "基準記録の測定モードが異なります。同じモードで基準を測り直してください。"
+                translate(
+                    self, "基準記録の測定モードが異なります。同じモードで基準を測り直してください。"
+                )
             )
 
     @Slot()
     def _mode_changed(self):
-        self.banner.setText(
+        set_text(
+            self.banner,
             "シミュレーション：合成信号で動作確認します。実機の音圧校正には使えません。"
             if self.simulate
-            else "NI DAQ 実機：設定したAI/AOで測定します。開始前に接続と測定位置を確認してください。"
+            else "NI DAQ 実機：設定したAI/AOで測定します。開始前に接続と測定位置を確認してください。",
         )
         self._clear_results()
         self._refresh()
@@ -968,16 +1344,22 @@ class CalibrationWindow(QMainWindow):
     def _clear_results(self):
         self.iterations.setRowCount(0)
         for value in (self.level_value, self.scale_value, self.peak_value):
-            value.setText("—")
-        self.result_file.setText("校正結果と再生用波形を、保存フォルダ内に新しい名前で保存します。")
+            set_text(value, "—")
+        set_text(
+            self.result_file, "校正結果と再生用波形を、保存フォルダ内に新しい名前で保存します。"
+        )
         self.last_output = None
         self.open_result_button.setEnabled(False)
 
     def _invalidate_stimulus(self):
         self.stimulus = None
         self.waveform.set_stimulus(None)
-        self.stimulus_info.setText("波形を確認するか、そのまま校正を開始してください。")
+        set_text(self.stimulus_info, "波形を確認するか、そのまま校正を開始してください。")
         self._clear_results()
+        set_text(self.playback_channel_info, "AO 1 ch / モノラル波形")
+        set_text(
+            self.playback_file_info, "WAV・NPZを選ぶか、波形校正画面で生成関数を指定してください。"
+        )
 
     def _refresh(self):
         if self.worker is not None:
@@ -985,37 +1367,56 @@ class CalibrationWindow(QMainWindow):
         try:
             setup = self.editor.setup()
         except (ValueError, TypeError) as error:
-            self.shared_rate.setText(f"設定を確認してください: {error}")
+            set_text(
+                self.shared_rate, "設定を確認してください: {error}", error=error_message(error)
+            )
             self.measure_button.setEnabled(False)
             self.preview_button.setEnabled(False)
             self.calibrate_button.setEnabled(False)
-            self.reference_status.setText("設定の入力を確認してください。")
+            set_text(self.reference_status, "設定の入力を確認してください。")
             self.monitor_start.setEnabled(False)
+            self.playback_start.setEnabled(False)
             return
-        self.shared_rate.setText(
-            f"共通SR: {setup.daq.sample_rate_hz:,} Hz  ·  WAVはこのレートへ自動変換"
+        set_text(
+            self.shared_rate,
+            "共通SR: {rate:,} Hz  ·  WAVはこのレートへ自動変換",
+            rate=setup.daq.sample_rate_hz,
         )
-        self.reference_instruction.setText(
-            f"校正器: {setup.reference_level_db:g} dB SPL / {setup.reference_frequency_hz:g} Hz\n"
-            f"取得: {setup.reference_duration_s:g} s  ·  AI: {setup.daq.input_channel}  ·  "
-            f"共通SR: {setup.daq.sample_rate_hz:,} Hz  ·  AOは0 Vを維持"
+        set_text(
+            self.reference_instruction,
+            "校正器: {level:g} dB SPL / {frequency:g} Hz\n"
+            "取得: {duration:g} s  ·  AI: {channel}  ·  共通SR: {rate:,} Hz  ·  AOは0 Vを維持",
+            level=setup.reference_level_db,
+            frequency=setup.reference_frequency_hz,
+            duration=setup.reference_duration_s,
+            channel=setup.daq.input_channel,
+            rate=setup.daq.sample_rate_hz,
         )
         valid = False
         if self.reference is None:
-            self.reference_status.setText(
-                "未測定：基準を測定するか、既存の記録を読み込んでください。"
+            set_text(
+                self.reference_status, "未測定：基準を測定するか、既存の記録を読み込んでください。"
             )
         else:
             try:
                 validate_reference(setup, self.reference)
                 self._check_backend(self.reference)
                 valid = True
-                self.reference_status.setText("使用可能：現在の設定・測定モードと一致しています。")
+                set_text(
+                    self.reference_status, "使用可能：現在の設定・測定モードと一致しています。"
+                )
             except ValueError:
-                self.reference_status.setText(
-                    "再基準測定が必要：設定または測定モードが変わっています。"
+                set_text(
+                    self.reference_status,
+                    "再基準測定が必要：設定または測定モードが変わっています。",
                 )
         selected = bool(self.source_location.text().strip())
+        if selected:
+            set_value(self.playback_source, self._source().location)
+        else:
+            set_text(self.playback_source, "再生する音声を選択してください。")
+        self.playback_start.setEnabled(selected)
+        self._volume_changed()
         try:
             self.target.value()
             valid_target = True
@@ -1025,29 +1426,33 @@ class CalibrationWindow(QMainWindow):
         self.monitor_start.setEnabled(True)
         self.preview_button.setEnabled(selected)
         self.calibrate_button.setEnabled(valid and selected and valid_target)
-        self.calibration_hint.setText(
+        set_text(
+            self.calibration_hint,
             "目標音圧の入力を確認してください。"
             if not valid_target
             else "準備完了"
             if valid and selected
             else "波形を選択してください。"
             if valid
-            else "有効なマイク基準記録が必要です。"
+            else "有効なマイク基準記録が必要です。",
         )
         self.open_result_button.setEnabled(self.last_output is not None)
         self.open_monitor_button.setEnabled(self.last_monitor_output is not None)
+        self.playback_open.setEnabled(self.last_monitor_output is not None)
 
     def _choose_source(self):
         index = self.source_kind.currentIndex()
         filters = ["WAV (*.wav)", "保存波形 (*.npz)", "Python (*.py)"]
-        path, _ = QFileDialog.getOpenFileName(self, "波形・生成関数を選択", "", filters[index])
+        path, _ = QFileDialog.getOpenFileName(
+            self, translate(self, "波形・生成関数を選択"), "", translate(self, filters[index])
+        )
         if path:
             self.source_location.setText(path)
             self._prepare()
 
     def _choose_parameters(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "生成関数のパラメータ", "", "YAML (*.yaml *.yml)"
+            self, translate(self, "生成関数のパラメータ"), "", "YAML (*.yaml *.yml)"
         )
         if path:
             self.parameters_path.setText(path)
@@ -1060,9 +1465,9 @@ class CalibrationWindow(QMainWindow):
             location += ":" + self.function_name.text().strip()
             text = self.parameters_path.text().strip()
             parameters = Path(text) if text else None
-        return StimulusSource(kind, location, parameters)
+        return StimulusSource(kind, location, parameters, self.wav_channels.currentData())
 
-    def _prepare(self, *, then_calibrate=False):
+    def _prepare(self, *, then_calibrate=False, then_playback=False, playback_preview=False):
         def prepare():
             setup = self.editor.setup()
             source = self._source()
@@ -1071,12 +1476,22 @@ class CalibrationWindow(QMainWindow):
                 if cancelled():
                     raise MeasurementCancelled("Measurement cancelled")
                 stimulus = source.prepare(setup.daq.sample_rate_hz)
-                measurement_bounds(stimulus, setup)
+                if not (then_playback or playback_preview):
+                    measurement_bounds(stimulus, setup)
                 if cancelled():
                     raise MeasurementCancelled("Measurement cancelled")
                 return stimulus
 
-            self._start("prepare_calibration" if then_calibrate else "prepare", task)
+            kind = (
+                "prepare_playback"
+                if then_playback
+                else "prepare_test_preview"
+                if playback_preview
+                else "prepare_calibration"
+                if then_calibrate
+                else "prepare"
+            )
+            self._start(kind, task)
 
         self._guard(prepare)
 
@@ -1088,18 +1503,57 @@ class CalibrationWindow(QMainWindow):
         rate = f"{stimulus.sample_rate_hz:,} Hz"
         if conversion:
             rate = f"{conversion['source_sample_rate_hz']:,} → {rate}"
-        self.stimulus_info.setText(
+        set_value(
+            self.stimulus_info,
             f"{rate}  ·  {info['duration_s']:.3f} s  ·  {info['sample_count']:,} samples\n"
-            f"RMS {info['digital_rms']:.4f}  /  Peak {info['digital_peak']:.4f}"
+            f"RMS {info['digital_rms']:.4f}  /  Peak {info['digital_peak']:.4f}",
         )
+        if stimulus.provenance.get("kind") == "wav":
+            mode = stimulus.provenance.get("channel_mode", "mono")
+            mode_text = {
+                "mono": "モノラルのみ",
+                "mix": "左右平均 (L+R)/2",
+                "left": "左チャンネル L",
+                "right": "右チャンネル R",
+            }[mode]
+            set_text(
+                self.playback_channel_info,
+                "元WAV {channels} ch → AO 1 ch / {mode}",
+                channels=stimulus.provenance.get("source_channels", 1),
+                mode=Message(mode_text),
+            )
+        else:
+            set_text(self.playback_channel_info, "AO 1 ch / モノラル波形")
+        original_rms = conversion.get("source_digital_rms") if conversion else info["digital_rms"]
+        original_peak = (
+            conversion.get("source_digital_peak") if conversion else info["digital_peak"]
+        )
+        if original_rms is not None and original_peak is not None:
+            change = 20 * math.log10(info["digital_rms"] / original_rms)
+            set_text(
+                self.playback_file_info,
+                "デジタル振幅: 変換前 RMS {before_rms:.6g} / Peak {before_peak:.6g} → 変換後 RMS {after_rms:.6g} / Peak {after_peak:.6g}（{change:+.3f} dB）",
+                before_rms=original_rms,
+                before_peak=original_peak,
+                after_rms=info["digital_rms"],
+                after_peak=info["digital_peak"],
+                change=change,
+            )
+        else:
+            set_text(
+                self.playback_file_info,
+                "変換後のデジタル振幅: RMS {rms:.6g} / Peak {peak:.6g}",
+                rms=info["digital_rms"],
+                peak=info["digital_peak"],
+            )
 
     def _output_path(self, kind):
         text = self.output_root.text().strip()
         if not text:
-            raise ValueError("保存フォルダを選択してください。")
+            raise ValueError(translate(self, "保存フォルダを選択してください。"))
         root = Path(text).expanduser().resolve()
         if root.exists() and not root.is_dir():
-            raise ValueError("保存先にはフォルダを指定してください。")
+            raise ValueError(translate(self, "保存先にはフォルダを指定してください。"))
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         suffix = ".json" if kind == "reference" else ""
         return root / f"{kind}-{stamp}{suffix}"
@@ -1108,21 +1562,33 @@ class CalibrationWindow(QMainWindow):
         if self.simulate:
             return True
         instruction = (
-            f"校正器を装着し、{setup.reference_level_db:g} dB SPL / "
-            f"{setup.reference_frequency_hz:g} Hzで動作させてください。AOは0 Vです。"
+            translate(
+                self,
+                "校正器を装着し、{level:g} dB SPL / {frequency:g} Hzで動作させてください。AOは0 Vです。",
+                level=setup.reference_level_db,
+                frequency=setup.reference_frequency_hz,
+            )
             if reference_mode
-            else "校正器を外し、マイクを実際の測定位置に置いてください。スピーカーから音が出ます。"
+            else translate(
+                self,
+                "校正器を外し、マイクを実際の測定位置に置いてください。スピーカーから音が出ます。",
+            )
         )
-        message = (
-            f"{instruction}\n\n"
-            f"AI: {setup.daq.input_channel} / AO: {setup.daq.output_channel}\n"
-            f"SR: {setup.daq.sample_rate_hz:,} Hz / 出力上限: {setup.daq.max_peak_v:g} Vpeak\n\n"
-            "動物・聴取者がいないことを確認して開始してください。"
+        message = translate(
+            self,
+            "{instruction}\n\nAI: {input} / AO: {output}\n"
+            "SR: {rate:,} Hz / 出力上限: {peak:g} Vpeak\n\n"
+            "動物・聴取者がいないことを確認して開始してください。",
+            instruction=instruction,
+            input=setup.daq.input_channel,
+            output=setup.daq.output_channel,
+            rate=setup.daq.sample_rate_hz,
+            peak=setup.daq.max_peak_v,
         )
         return (
             QMessageBox.question(
                 self,
-                "実機測定を開始",
+                translate(self, "実機測定を開始"),
                 message,
                 QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
@@ -1138,15 +1604,18 @@ class CalibrationWindow(QMainWindow):
             if not self._confirm_hardware(setup, reference_mode=True):
                 return
             self.job_output = output
-            self._start(
-                "reference",
-                lambda cancelled, progress: measure_reference_to_file(
+
+            def task(cancelled, progress):
+                meter = LiveMeter(setup, None, progress)
+                return measure_reference_to_file(
                     setup,
                     output,
                     simulate=simulate,
                     cancel_requested=cancelled,
-                ),
-            )
+                    on_samples=meter.push,
+                )
+
+            self._start("reference", task)
 
         self._guard(measure)
 
@@ -1158,7 +1627,7 @@ class CalibrationWindow(QMainWindow):
         def search():
             setup = self.editor.setup()
             if self.reference is None:
-                raise ValueError("先にマイク基準を測定・読み込みしてください。")
+                raise ValueError(translate(self, "先にマイク基準を測定・読み込みしてください。"))
             validate_reference(setup, self.reference)
             self._check_backend(self.reference)
             measurement_bounds(self.stimulus, setup)
@@ -1175,6 +1644,7 @@ class CalibrationWindow(QMainWindow):
                 if cancelled():
                     raise MeasurementCancelled("Measurement cancelled")
                 hardware = make_hardware(setup, simulate=simulate)
+                meter = LiveMeter(setup, reference, progress)
                 return calibrate_to_directory(
                     stimulus,
                     setup=setup,
@@ -1185,6 +1655,7 @@ class CalibrationWindow(QMainWindow):
                     on_iteration=progress,
                     cancel_requested=cancelled,
                     parent_run=parent_run,
+                    on_samples=meter.push,
                 )
 
             self._start("calibrate", task, max_iterations=setup.measurement.max_iterations)
@@ -1194,21 +1665,27 @@ class CalibrationWindow(QMainWindow):
     def _set_busy(self, busy):
         for cls in (QLineEdit, QPlainTextEdit, QComboBox, QDoubleSpinBox, QPushButton, QCheckBox):
             for widget in self.findChildren(cls):
-                if widget is not self.stop_button:
+                if widget not in (self.stop_button, self.language):
                     widget.setEnabled(not busy)
         self.stop_button.setEnabled(busy)
-        self.stop_button.setText("停止")
+        playing = busy and self.job_kind == "test_playback"
+        self.volume_fader.setEnabled(not busy or playing)
+        self.mute_button.setEnabled(not busy or playing)
+        self.playback_stop.setEnabled(playing)
+        set_text(self.stop_button, "停止")
         if not busy:
             self._refresh()
 
     def _start(self, kind, task, max_iterations=None):
         if self.worker is not None:
-            raise RuntimeError("別の処理が実行中です。")
+            raise RuntimeError(translate(self, "別の処理が実行中です。"))
         self._audit(
             "operation_started",
             operation=kind,
             context=self._context(),
-            output=str(self.job_output) if kind in {"reference", "calibrate", "monitor"} else None,
+            output=str(self.job_output)
+            if kind in {"reference", "calibrate", "monitor", "test_playback"}
+            else None,
         )
         self.job_kind = kind
         self.worker = Operation(task, self)
@@ -1217,20 +1694,30 @@ class CalibrationWindow(QMainWindow):
         self._set_busy(True)
         self.progress.setRange(0, max_iterations or 0)
         self.progress.setValue(0)
-        self.status.setText(
+        set_text(
+            self.status,
             {
                 "prepare": "波形を準備しています…",
                 "prepare_calibration": "校正用の波形を準備しています…",
+                "prepare_playback": "テスト再生用の音声を準備しています…",
+                "prepare_test_preview": "テスト再生用の音声を準備しています…",
                 "reference": "マイク基準を測定しています…",
                 "calibrate": "目標音圧になる電圧倍率を探索しています…",
                 "restore": "実行記録を照合して、条件を復元しています…",
                 "monitor": "マイク入力をモニターしています。停止ボタンで終了します。",
-            }[kind]
+                "test_playback": "テスト再生中です。フェーダーで調節し、停止ボタンで中断できます。",
+            }[kind],
         )
         self.worker.start()
 
     @Slot(dict)
     def _iteration(self, item):
+        if item.get("kind") == "hardware":
+            self._hardware_info(item["description"])
+            return
+        if item.get("kind") == "test_playback":
+            self._playback_frame(item)
+            return
         if item.get("kind") == "monitor":
             self._monitor_frame(item)
             return
@@ -1245,13 +1732,16 @@ class CalibrationWindow(QMainWindow):
             "—" if error is None else f"{error:+.3f}",
         ]
         for column, value in enumerate(values):
-            cell = QTableWidgetItem(value)
+            cell = (
+                set_cell(self.iterations, number, column, "SNR不足")
+                if column == 1 and level is None
+                else set_cell(self.iterations, number, column, "{value}", value=value)
+            )
             cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.iterations.setItem(number, column, cell)
         self.iterations.scrollToBottom()
         self.progress.setValue(item["iteration"])
-        self.level_value.setText("SNR不足" if level is None else f"{level:.2f}")
-        self.peak_value.setText(f"{item['output_peak_v']:.6g}")
+        set_text(self.level_value, "SNR不足" if level is None else f"{level:.2f}")
+        set_value(self.peak_value, f"{item['output_peak_v']:.6g}")
 
     @Slot()
     def _finished(self):
@@ -1265,7 +1755,12 @@ class CalibrationWindow(QMainWindow):
         self._set_busy(False)
         try:
             extra = {}
-            if error is None and kind in {"prepare", "prepare_calibration"}:
+            if error is None and kind in {
+                "prepare",
+                "prepare_calibration",
+                "prepare_playback",
+                "prepare_test_preview",
+            }:
                 path = self.activity.save_waveform(result)
                 extra = {"stimulus": result.describe(), "saved_waveform": str(path)}
             elif error is None and kind == "reference":
@@ -1285,7 +1780,7 @@ class CalibrationWindow(QMainWindow):
                 else "complete",
                 error=str(error) if error else None,
                 output=str(self.job_output)
-                if kind in {"reference", "calibrate", "monitor"}
+                if kind in {"reference", "calibrate", "monitor", "test_playback"}
                 else None,
                 notes=getattr(error, "__notes__", []) if error else [],
                 **extra,
@@ -1296,47 +1791,72 @@ class CalibrationWindow(QMainWindow):
                 self.close()
             return
         if error is not None:
-            self.status.setText(
-                "停止しました。" if isinstance(error, MeasurementCancelled) else f"エラー: {error}"
-            )
+            if isinstance(error, MeasurementCancelled):
+                set_text(self.status, "停止しました。")
+            else:
+                set_text(self.status, "エラー: {details}", details=error_message(error))
             if kind == "calibrate" and self.job_output.is_dir():
                 self.last_output = self.job_output
-                self.result_file.setText(f"未完了の記録: {self.job_output}")
+                set_text(self.result_file, "未完了の記録: {path}", path=self.job_output)
                 self.open_result_button.setEnabled(True)
             if kind == "monitor":
-                self.monitor_status.setText(
+                set_text(
+                    self.monitor_status,
                     "モニターを停止しました。"
                     if isinstance(error, MeasurementCancelled)
-                    else "モニターを停止しました。エラーの詳細を確認してください。"
+                    else "モニターを停止しました。エラーの詳細を確認してください。",
                 )
+            if kind == "test_playback":
+                set_text(
+                    self.playback_status, "再生を停止しました。記録とエラーを確認してください。"
+                )
+                set_text(self.playback_peak, "出力確認")
             if not isinstance(error, MeasurementCancelled) and not self._closing:
                 self._show_error(error)
-        elif kind in {"prepare", "prepare_calibration"}:
+        elif kind in {"prepare", "prepare_calibration", "prepare_playback", "prepare_test_preview"}:
             self._show_stimulus(result)
-            self.status.setText("波形を確認しました。校正ではこの波形を固定して使います。")
+            set_text(self.status, "波形を確認しました。校正ではこの波形を固定して使います。")
             if kind == "prepare_calibration" and not self._closing:
                 self._calibrate()
+            if kind == "prepare_playback" and not self._closing:
+                self._test_playback()
         elif kind == "reference":
             self._set_reference(result, self.job_output)
-            self.status.setText("基準を保存しました。校正器を外し、波形校正へ進んでください。")
+            set_text(self.status, "基準を保存しました。校正器を外し、波形校正へ進んでください。")
         elif kind == "restore":
             self._apply_replay(result)
         elif kind == "monitor":
-            self.monitor_status.setText(f"停止しました · 記録時間 {result['duration_s']:.1f} s")
-            self.status.setText("マイクモニターを停止し、記録を保存しました。")
+            set_text(
+                self.monitor_status,
+                "停止しました · 記録時間 {duration:.1f} s",
+                duration=result["duration_s"],
+            )
+            set_text(self.status, "マイクモニターを停止し、記録を保存しました。")
+        elif kind == "test_playback":
+            set_value(self.playback_peak, "0")
+            set_text(
+                self.playback_status,
+                "再生終了 · {duration:.2f} s · 保存先 {path}",
+                duration=result["duration_s"],
+                path=self.job_output,
+            )
+            set_text(self.status, "テスト再生を終了し、AOの停止・0 V指令と記録保存を完了しました。")
         else:
-            self.level_value.setText(f"{result.measured_spl_db:.2f}")
-            self.scale_value.setText(f"{result.scale_v:.7g}")
-            self.peak_value.setText(f"{result.output_peak_v:.6g}")
+            set_text(self.level_value, f"{result.measured_spl_db:.2f}")
+            set_value(self.scale_value, f"{result.scale_v:.7g}")
+            set_value(self.peak_value, f"{result.output_peak_v:.6g}")
             self.last_output = self.job_output
-            self.result_file.setText(str(self.job_output / "result.json"))
+            set_value(self.result_file, str(self.job_output / "result.json"))
             self.open_result_button.setEnabled(True)
-            self.status.setText("校正が完了しました。結果と再生用のstimulus.npzを保存しました。")
+            set_text(self.status, "校正が完了しました。結果と再生用のstimulus.npzを保存しました。")
         if kind == "calibrate":
             self._scan_history()
-        if kind == "monitor" and self.job_output.is_dir():
+        if kind in {"monitor", "test_playback"} and self.job_output.is_dir():
             self.last_monitor_output = self.job_output
             self.open_monitor_button.setEnabled(True)
+            self.playback_open.setEnabled(True)
+        if kind in {"reference", "calibrate", "test_playback"}:
+            set_text(self.monitor_status, "取得終了。最後の入力スペクトラムを表示しています。")
         if self._closing:
             self.close()
 
@@ -1346,13 +1866,20 @@ class CalibrationWindow(QMainWindow):
             try:
                 self._audit("stop_requested", operation=self.job_kind)
             except Exception as error:
-                self.status.setText(f"停止要求済み。操作ログの保存に失敗しました: {error}")
+                set_text(
+                    self.status,
+                    "停止要求済み。操作ログの保存に失敗しました: {error}",
+                    error=error_message(error),
+                )
                 self.stop_button.setEnabled(False)
                 return
             self.stop_button.setEnabled(False)
-            self.stop_button.setText("停止待ち…")
-            self.status.setText(
-                "停止要求済み：現在の取得・波形準備が終わり次第、安全に終了します。"
+            set_text(self.stop_button, "停止待ち…")
+            set_text(
+                self.status,
+                "停止要求済み：短い取得単位で中断し、AOを0 Vへ戻します。"
+                if self.job_kind in {"reference", "calibrate", "monitor", "test_playback"}
+                else "停止要求済み：波形準備の完了後に終了します。",
             )
 
     def _open_result(self):

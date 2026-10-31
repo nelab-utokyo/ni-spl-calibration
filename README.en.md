@@ -36,7 +36,9 @@ uv run ni-spl
 
 Before the first launch, install the dependencies with `uv sync --locked --extra gui --extra daq` as shown above.
 
-The interface uses Japanese labels and starts in **simulation mode**. Select `NI DAQ 実機` at the top right for physical hardware.
+The application starts in **NI DAQ hardware mode**. Launching the GUI does not access the DAQ; a measurement or monitor must be started explicitly. Select Simulation at the top to check the software without hardware.
+
+Use **Language** at the top to switch between Japanese and English. Settings, selected files, prepared samples, reference records and results remain intact. Record keys, units and user-entered equipment notes are not translated.
 
 | Tab | Workflow |
 |---|---|
@@ -44,9 +46,10 @@ The interface uses Japanese labels and starts in **simulation mode**. Select `NI
 | **2 マイク基準測定 (Microphone reference)** | Fit the calibrator, measure and save a reference, or load a compatible existing JSON |
 | **3 波形校正 (Waveform calibration)** | Remove the calibrator and position the microphone. Select WAV/NPZ/generator, preview the waveform and resampling, set the target and start calibration |
 | **4 履歴・再現 (History and restore)** | Restore conditions from successful, failed or cancelled runs, including runs saved elsewhere |
-| **5 マイクモニター (Microphone monitor)** | View live continuous AI, RMS/peak voltage and calibrated total SPL. Optionally save raw captures |
+| **5 マイクモニター (Microphone monitor)** | View logarithmic frequency bars, RMS/peak voltage and total SPL. Optionally save raw captures |
+| **6 テスト再生 (Test playback)** | Play WAV/generated audio through AO with a live volume fader and simultaneous microphone monitoring; no reference required |
 
-Set the sample rate once in the setup tab. Measurement runs in a worker thread while the GUI displays iterations and levels. Stop or closing the window requests cooperative cancellation after the current finite acquisition, attempts to return AO to 0 V, and preserves completed iterations. It is not an immediate hardware cutoff. Every run receives a new output path. Changes to rate, hardware/input settings or backend require a compatible reference.
+Set the sample rate once in the setup tab. Measurement runs in a worker thread while the GUI displays iterations and levels. Stop and closing the window are supported during playback. NI reads are split into approximately 20 ms chunks: cancellation stops AO, then AI, closes the tasks and commands 0 V. The full waveform need not finish. USB, OS and driver latency still apply; this is not a hardware cutoff with a guaranteed response time. Every run receives a new output path. Changes to rate, hardware/input settings or backend require a compatible reference.
 
 ### Records and reproducibility
 
@@ -58,11 +61,23 @@ GUI operation starts, completion, failures, stop requests and setup/reference fi
 
 ### Live microphone monitoring
 
-In the monitor tab, click `モニターを開始`. The display updates approximately every 100 ms, showing the latest second at the common setup rate. Without a valid reference, voltage is shown. With a valid reference, SPL is **total input pressure including background**, within the configured band; it differs from calibration's background-subtracted signal level. Clipping is flagged and the frame's SPL is not reported.
+In the monitor tab, click Start monitor. The spectrum updates approximately every 100 ms. Frequency is logarithmic, up to Nyquist; bars show approximately third-octave RMS voltage levels in dBV (relative to 1 V). This is a display, not an equalization filter. With a valid reference, **total SPL including background** is also shown in the configured measurement band; it differs from calibration's background-subtracted signal level. Clipping is flagged and the frame's SPL is not reported. Reference and calibration captures also feed this live display.
 
 AO stays at 0 V. Monitoring and reference/calibration tasks are mutually exclusive. Use Stop before continuing measurements.
 
 Each `monitor-<timestamp>/` folder stores setup, reference, hardware information, `levels.jsonl` and a final `summary.json` (or a failure record). Raw input recording is enabled by default. Consecutive `capture-*.npz` files contain `samples` in volts, `sample_rate_hz` and `first_sample`; their SHA-256 hashes are recorded in the level log. Disabling raw captures still preserves the level time series and activity log.
+
+### Test playback
+
+Select audio or the built-in 1 kHz tone in Test playback. Generators selected in Waveform calibration are also supported. Stereo WAVs can be averaged as (L+R)/2 (the GUI default), or the left/right channel selected. The resulting mono samples and channel policy are recorded; pre/post-resampling RMS and peak are displayed. Anti-phase channels can cancel when averaged; select the left or right channel when needed.
+
+Start playback, then adjust the live fader. 100% corresponds to `max_peak_v`; the default 10% gives 0.05 Vpeak with a 0.5 V limit. This is not a calibrated SPL setting. Mute, mid-file Stop, looping and simultaneous microphone frequency bars are available without a reference.
+
+The device, AI/AO channels and commanded AO peak are displayed during playback. The commanded voltage is the program's output value, not a measurement at the analog terminal.
+
+Each `playback-<timestamp>/` records setup, stimulus, optional reference, `playback.json`, `levels.jsonl` and a summary/failure record. Applied fader settings, 10 ms gain ramps and spectra are logged. With raw capture enabled, `capture-*.npz` contains microphone `samples`, the AO `output_v` written, sample rate and starting sample position.
+
+Preview emits no audio; standalone microphone monitoring holds AO at 0 V. Use Test playback for an audible check.
 
 ## Using commands
 
@@ -199,7 +214,7 @@ From Python, pass `Stimulus(samples, setup.daq.sample_rate_hz)`, `load_wav(path,
 
 This version calibrates the **overall level of each waveform**. It does not flatten the speaker's frequency response. Calibrate sounds with different spectra separately, even when their digital RMS values match.
 
-If your experiment generates new noise on every trial, distinguish this result for one fixed waveform from the distribution across stimuli. Check level variability using other seeds or a representative waveform set. Infinite real-time streams, stereo, and synchronization across multiple DAQ devices are outside this version's scope.
+If your experiment generates new noise on every trial, distinguish this result for one fixed waveform from the distribution across stimuli. Check level variability using other seeds or a representative waveform set. Calibration supports finite mono waveforms; stereo WAVs can be explicitly mixed/selected to mono. Stereo output and multiple-DAQ synchronization remain outside scope. Test-playback looping is for output checks, not infinite-stream SPL calibration.
 
 The output is constrained by a peak-voltage limit and upward search steps of at most 6 dB. The package attempts to return AO to 0 V after each acquisition, on exceptions, and on Ctrl+C. Input clipping is checked against both voltage rails, including DC offsets and samples outside the analysis window. Software cannot guarantee output reset after operating-system termination, power loss, or disconnection.
 

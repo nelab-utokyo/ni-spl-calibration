@@ -64,23 +64,41 @@ class Stimulus:
         }
 
 
-def load_wav(path: str | Path, *, sample_rate_hz: int | None = None) -> Stimulus:
-    """Read mono WAV; optionally resample to a target rate without normalization.
+def load_wav(
+    path: str | Path, *, sample_rate_hz: int | None = None, channel_mode: str = "mono"
+) -> Stimulus:
+    """Read WAV; optionally select/mix stereo and resample without normalization.
 
     Omit sample_rate_hz to retain the original samples and rate. A matching target
     also preserves the samples exactly. Conversion uses an anti-aliasing FIR filter
     and records the original rate/count; the returned samples are what to calibrate.
+    The default channel_mode='mono' rejects stereo. 'mix', 'left', and 'right'
+    explicitly select the one-channel waveform sent to AO.
     """
     if sample_rate_hz is not None:
         _validate_sample_rate(sample_rate_hz)
+    if channel_mode not in {"mono", "mix", "left", "right"}:
+        raise ValueError("Invalid WAV channel mode")
     path = Path(path)
     contents = path.read_bytes()
     with sf.SoundFile(BytesIO(contents)) as audio:
         if audio.format not in {"WAV", "WAVEX", "RF64"}:
             raise ValueError("Expected a WAV file")
-        if audio.channels != 1:
+        if audio.channels != 1 and channel_mode == "mono":
             raise ValueError("Only mono WAV is supported; select/mix channels explicitly")
-        samples = audio.read(dtype="float64")
+        if audio.channels > 2:
+            raise ValueError("Select a mono or stereo WAV")
+        if channel_mode == "right" and audio.channels < 2:
+            raise ValueError("Right-channel selection requires a stereo WAV")
+        channels = audio.channels
+        original = audio.read(dtype="float64", always_2d=True)
+        samples = (
+            original.mean(axis=1)
+            if channel_mode == "mix"
+            else original[:, 1]
+            if channel_mode == "right"
+            else original[:, 0]
+        )
         rate = audio.samplerate
     stimulus = Stimulus(
         samples,
@@ -89,6 +107,10 @@ def load_wav(path: str | Path, *, sample_rate_hz: int | None = None) -> Stimulus
             "kind": "wav",
             "name": path.name,
             "file_sha256": hashlib.sha256(contents).hexdigest(),
+            "source_channels": channels,
+            "channel_mode": channel_mode,
+            "file_digital_rms": float(np.sqrt(np.mean(original**2))),
+            "file_digital_peak": float(np.max(np.abs(original))),
         },
     )
     if sample_rate_hz is None or sample_rate_hz == rate:
@@ -115,6 +137,8 @@ def load_wav(path: str | Path, *, sample_rate_hz: int | None = None) -> Stimulus
                 "method": "scipy.signal.resample_poly",
                 "source_sample_rate_hz": rate,
                 "source_sample_count": len(stimulus.samples),
+                "source_digital_rms": float(np.sqrt(np.mean(stimulus.samples**2))),
+                "source_digital_peak": float(np.max(np.abs(stimulus.samples))),
                 "target_sample_rate_hz": sample_rate_hz,
                 "window": ["kaiser", 5.0],
                 "padtype": "constant",

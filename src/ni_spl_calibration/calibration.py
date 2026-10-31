@@ -10,6 +10,7 @@ import numpy as np
 
 from .analysis import band_power, tone_rms, validate_capture
 from .config import Setup
+from .errors import CalibrationError, MeasurementCancelled
 from .hardware import Hardware, NIDaqHardware, output_guard
 from .stimulus import Stimulus
 
@@ -54,19 +55,18 @@ class Reference:
         object.__setattr__(self, "setup", json.loads(json.dumps(self.setup, allow_nan=False)))
 
 
-class CalibrationError(RuntimeError):
-    def __init__(self, message, iterations=()):
-        super().__init__(message)
-        self.iterations = list(iterations)
-
-
-class MeasurementCancelled(CalibrationError):
-    """A cooperative stop requested between finite hardware operations."""
-
-
 def _check_cancelled(cancel_requested, iterations=()):
     if cancel_requested is not None and cancel_requested():
         raise MeasurementCancelled("Measurement cancelled", iterations)
+
+
+def _capture(method, values, cancel_requested, on_samples):
+    options = {}
+    if cancel_requested is not None:
+        options["cancel_requested"] = cancel_requested
+    if on_samples is not None:
+        options["on_chunk"] = on_samples
+    return method(values, **options)
 
 
 @dataclass(frozen=True)
@@ -123,7 +123,7 @@ def validate_reference(setup: Setup, reference: Reference, hardware: Hardware | 
 
 
 def measure_reference(
-    setup: Setup, *, hardware: Hardware | None = None, cancel_requested=None
+    setup: Setup, *, hardware: Hardware | None = None, cancel_requested=None, on_samples=None
 ) -> Reference:
     _check_cancelled(cancel_requested)
     hardware = hardware if hardware is not None else NIDaqHardware(setup.daq)
@@ -134,7 +134,10 @@ def measure_reference(
     with output_guard(hardware):
         _check_cancelled(cancel_requested)
         values = validate_capture(
-            hardware.acquire(count), count, setup.daq, setup.measurement.input_clip_fraction
+            _capture(hardware.acquire, count, cancel_requested, on_samples),
+            count,
+            setup.daq,
+            setup.measurement.input_clip_fraction,
         )
         _check_cancelled(cancel_requested)
         frequencies = np.fft.rfftfreq(count, 1 / fs)
@@ -218,6 +221,7 @@ def calibrate(
     hardware: Hardware | None = None,
     on_iteration=None,
     cancel_requested=None,
+    on_samples=None,
 ) -> CalibrationResult:
     """Find volts per digital unit. Measure the exact same waveform each time."""
     if not math.isfinite(target_spl_db) or not -100 <= target_spl_db <= 180:
@@ -239,7 +243,10 @@ def calibrate(
             _check_cancelled(cancel_requested, history)
             count = last - first
             background = validate_capture(
-                hardware.acquire(count), count, setup.daq, settings.input_clip_fraction
+                _capture(hardware.acquire, count, cancel_requested, on_samples),
+                count,
+                setup.daq,
+                settings.input_clip_fraction,
             )
             background_power = band_power(background, fs, settings)
             for number in range(1, settings.max_iterations + 1):
@@ -247,7 +254,7 @@ def calibrate(
                 # Include the delayed acoustic tail and a final 0 V sample.
                 output = np.concatenate((stimulus.samples * scale, np.zeros(delay + 1)))
                 samples = validate_capture(
-                    hardware.play_and_record(output),
+                    _capture(hardware.play_and_record, output, cancel_requested, on_samples),
                     len(output),
                     setup.daq,
                     settings.input_clip_fraction,
@@ -319,7 +326,7 @@ def calibrate(
                     )
                 scale = next_scale
             raise CalibrationError("Search did not converge within max_iterations", history)
-    except KeyboardInterrupt as error:
+    except (KeyboardInterrupt, MeasurementCancelled) as error:
         error.iterations = list(history)
         raise
     except Exception as error:

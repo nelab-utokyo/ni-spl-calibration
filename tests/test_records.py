@@ -83,8 +83,8 @@ def test_reference_cooperative_stop_resets_output():
         def reset_output(self):
             self.resets += 1
 
-        def acquire(self, count):
-            values = super().acquire(count)
+        def acquire(self, count, **options):
+            values = super().acquire(count, **options)
             event.set()
             return values
 

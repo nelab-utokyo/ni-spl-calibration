@@ -4,6 +4,7 @@ import importlib.metadata
 import math
 import platform
 import time
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import asdict
 from typing import Protocol
@@ -11,6 +12,7 @@ from typing import Protocol
 import numpy as np
 
 from .config import DaqSettings
+from .errors import MeasurementCancelled
 
 
 class Hardware(Protocol):
@@ -19,9 +21,36 @@ class Hardware(Protocol):
 
     def describe(self) -> dict: ...
     def reset_output(self) -> None: ...
-    def acquire(self, sample_count: int) -> np.ndarray: ...
-    def play_and_record(self, output_v: np.ndarray) -> np.ndarray: ...
+    def acquire(self, sample_count: int, *, cancel_requested=None, on_chunk=None) -> np.ndarray: ...
+    def play_and_record(
+        self, output_v: np.ndarray, *, cancel_requested=None, on_chunk=None
+    ) -> np.ndarray: ...
     def monitor(self, block_size: int, *, cancel_requested): ...
+    def duplex(self, blocks, block_size: int, *, cancel_requested, total_samples=None): ...
+
+
+def check_stop(cancel_requested):
+    if cancel_requested is not None and cancel_requested():
+        raise MeasurementCancelled("Measurement cancelled")
+
+
+@contextmanager
+def stop_tasks(*tasks):
+    """Stop AO before AI, then let task contexts close before the 0 V reset."""
+    primary = None
+    try:
+        yield
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        for task in tasks:
+            try:
+                task.stop()
+            except Exception as error:
+                if primary is None or isinstance(primary, GeneratorExit):
+                    raise
+                primary.add_note(f"DAQ task stop also failed: {error}")
 
 
 @contextmanager
@@ -124,7 +153,65 @@ class NIDaqHardware:
         if not math.isclose(task.timing.samp_clk_rate, self.settings.sample_rate_hz, rel_tol=1e-9):
             raise RuntimeError("DAQ coerced the sample rate; choose an exactly supported rate")
 
-    def acquire(self, sample_count):
+    def _output(self, task):
+        from nidaqmx.constants import AOIdleOutputBehavior
+
+        channel = task.ao_channels.add_ao_voltage_chan(
+            self.settings.output_channel,
+            min_val=-self.settings.max_peak_v,
+            max_val=self.settings.max_peak_v,
+        )
+        try:
+            channel.ao_idle_output_behavior = AOIdleOutputBehavior.ZERO_VOLTS
+        except self._daq.DaqError:
+            pass  # Some devices do not support idle behavior; explicit reset remains mandatory.
+
+    def _read_samples(self, reader, sample_count, *, cancel_requested=None, on_chunk=None):
+        values = np.empty(sample_count)
+        block_size = max(1, round(self.settings.sample_rate_hz * 0.02))
+        for first in range(0, sample_count, block_size):
+            check_stop(cancel_requested)
+            part = values[first : first + block_size]
+            count = reader.read_many_sample(
+                part,
+                number_of_samples_per_channel=len(part),
+                timeout=max(0.25, len(part) / self.settings.sample_rate_hz + 0.1),
+            )
+            if count != len(part):
+                raise RuntimeError("Incomplete AI read")
+            if on_chunk is not None:
+                on_chunk(part.copy())
+            check_stop(cancel_requested)
+        return values
+
+    def _pair_clock(self, ai, ao, mode, sample_count, *, buffer_size=None):
+        from nidaqmx.constants import TaskMode
+
+        self._input(ai)
+        self._output(ao)
+        ao.timing.cfg_samp_clk_timing(
+            self.settings.sample_rate_hz,
+            sample_mode=mode,
+            samps_per_chan=sample_count,
+        )
+        device = self.settings.output_channel.split("/")[0]
+        ai.timing.cfg_samp_clk_timing(
+            self.settings.sample_rate_hz,
+            source=f"/{device}/ao/SampleClock",
+            sample_mode=mode,
+            samps_per_chan=sample_count,
+        )
+        if buffer_size is not None:
+            from nidaqmx.constants import RegenerationMode
+
+            ao.out_stream.regen_mode = RegenerationMode.DONT_ALLOW_REGENERATION
+            ao.out_stream.output_buf_size = buffer_size
+        ao.control(TaskMode.TASK_COMMIT)
+        self._check_rate(ao)
+        ai.control(TaskMode.TASK_COMMIT)
+        self._check_rate(ai)
+
+    def acquire(self, sample_count, *, cancel_requested=None, on_chunk=None):
         from nidaqmx.constants import AcquisitionType, TaskMode
         from nidaqmx.stream_readers import AnalogSingleChannelReader
 
@@ -138,19 +225,18 @@ class NIDaqHardware:
                 )
                 task.control(TaskMode.TASK_COMMIT)
                 self._check_rate(task)
-                values = np.empty(sample_count)
-                task.start()
-                count = AnalogSingleChannelReader(task.in_stream).read_many_sample(
-                    values,
-                    number_of_samples_per_channel=sample_count,
-                    timeout=sample_count / self.settings.sample_rate_hz + 5,
-                )
-                if count != sample_count:
-                    raise RuntimeError("Incomplete AI capture")
-                return values
+                with stop_tasks(task):
+                    check_stop(cancel_requested)
+                    task.start()
+                    return self._read_samples(
+                        AnalogSingleChannelReader(task.in_stream),
+                        sample_count,
+                        cancel_requested=cancel_requested,
+                        on_chunk=on_chunk,
+                    )
 
-    def play_and_record(self, output_v):
-        from nidaqmx.constants import AcquisitionType, AOIdleOutputBehavior, TaskMode
+    def play_and_record(self, output_v, *, cancel_requested=None, on_chunk=None):
+        from nidaqmx.constants import AcquisitionType
         from nidaqmx.stream_readers import AnalogSingleChannelReader
         from nidaqmx.stream_writers import AnalogSingleChannelWriter
 
@@ -165,46 +251,81 @@ class NIDaqHardware:
         timeout = count / self.settings.sample_rate_hz + 5
         with output_guard(self):
             with self._daq.Task() as ai, self._daq.Task() as ao:
-                self._input(ai)
-                channel = ao.ao_channels.add_ao_voltage_chan(
-                    self.settings.output_channel,
-                    min_val=-self.settings.max_peak_v,
-                    max_val=self.settings.max_peak_v,
-                )
-                try:
-                    channel.ao_idle_output_behavior = AOIdleOutputBehavior.ZERO_VOLTS
-                except self._daq.DaqError:
-                    pass  # Some devices do not support idle behavior; explicit reset remains mandatory.
-                ao.timing.cfg_samp_clk_timing(
-                    self.settings.sample_rate_hz,
-                    sample_mode=AcquisitionType.FINITE,
-                    samps_per_chan=count,
-                )
-                # AI is armed first and receives exactly the AO sample-clock edges.
-                device = self.settings.output_channel.split("/")[0]
-                ai.timing.cfg_samp_clk_timing(
-                    self.settings.sample_rate_hz,
-                    source=f"/{device}/ao/SampleClock",
-                    sample_mode=AcquisitionType.FINITE,
-                    samps_per_chan=count,
-                )
-                ao.control(TaskMode.TASK_COMMIT)
-                self._check_rate(ao)
-                ai.control(TaskMode.TASK_COMMIT)
+                self._pair_clock(ai, ao, AcquisitionType.FINITE, count)
                 writer = AnalogSingleChannelWriter(ao.out_stream, auto_start=False)
-                written = writer.write_many_sample(output_v, timeout=timeout)
-                if written != count:
-                    raise RuntimeError("Incomplete AO write")
-                values = np.empty(count)
-                ai.start()
-                ao.start()
-                read = AnalogSingleChannelReader(ai.in_stream).read_many_sample(
-                    values, number_of_samples_per_channel=count, timeout=timeout
+                with stop_tasks(ao, ai):
+                    check_stop(cancel_requested)
+                    written = writer.write_many_sample(output_v, timeout=timeout)
+                    if written != count:
+                        raise RuntimeError("Incomplete AO write")
+                    check_stop(cancel_requested)
+                    ai.start()
+                    ao.start()
+                    values = self._read_samples(
+                        AnalogSingleChannelReader(ai.in_stream),
+                        count,
+                        cancel_requested=cancel_requested,
+                        on_chunk=on_chunk,
+                    )
+                    check_stop(cancel_requested)
+                    ao.wait_until_done(timeout=0.25)
+                    return values
+
+    def duplex(self, blocks, block_size, *, cancel_requested, total_samples=None):
+        """Stream non-regenerating AO with AI driven by the same AO sample clock."""
+        from nidaqmx.constants import AcquisitionType
+        from nidaqmx.stream_readers import AnalogSingleChannelReader
+        from nidaqmx.stream_writers import AnalogSingleChannelWriter
+
+        with output_guard(self):
+            with self._daq.Task() as ai, self._daq.Task() as ao:
+                mode = (
+                    AcquisitionType.CONTINUOUS if total_samples is None else AcquisitionType.FINITE
                 )
-                if read != count:
-                    raise RuntimeError("Incomplete AI read")
-                ao.wait_until_done(timeout=timeout)
-                return values
+                self._pair_clock(
+                    ai, ao, mode, total_samples or block_size * 4, buffer_size=block_size * 4
+                )
+                pending = deque()
+                source = iter(blocks)
+                writer = AnalogSingleChannelWriter(ao.out_stream, auto_start=False)
+
+                def enqueue():
+                    block = next(source, None)
+                    if block is None:
+                        return False
+                    output = np.asarray(block["output"], dtype=float)
+                    if output.shape != (block_size,) or not np.all(np.isfinite(output)):
+                        raise ValueError("Invalid playback block")
+                    if np.max(np.abs(output)) > self.settings.max_peak_v * (1 + 1e-12):
+                        raise ValueError("Output exceeds max_peak_v")
+                    check_stop(cancel_requested)
+                    written = writer.write_many_sample(output, timeout=0.25)
+                    if written != block_size:
+                        raise RuntimeError("Incomplete AO streaming write")
+                    pending.append(block)
+                    return True
+
+                with stop_tasks(ao, ai):
+                    try:
+                        enqueue()
+                        enqueue()  # About 100 ms of lead, so fader changes remain responsive.
+                        if not pending:
+                            return
+                        check_stop(cancel_requested)
+                        ai.start()
+                        ao.start()
+                        reader = AnalogSingleChannelReader(ai.in_stream)
+                        while pending:
+                            values = self._read_samples(
+                                reader, block_size, cancel_requested=cancel_requested
+                            )
+                            played = pending.popleft()
+                            enqueue()  # Refill before GUI work or capture-file compression.
+                            yield {**played, "samples": values}
+                        check_stop(cancel_requested)
+                        ao.wait_until_done(timeout=0.25)
+                    except MeasurementCancelled:
+                        return
 
     def monitor(self, block_size, *, cancel_requested):
         """Read consecutive blocks from one continuous AI task; keep AO at 0 V."""
@@ -222,17 +343,15 @@ class NIDaqHardware:
                 task.control(TaskMode.TASK_COMMIT)
                 self._check_rate(task)
                 reader = AnalogSingleChannelReader(task.in_stream)
-                values = np.empty(block_size)
-                task.start()
-                while not cancel_requested():
-                    count = reader.read_many_sample(
-                        values,
-                        number_of_samples_per_channel=block_size,
-                        timeout=block_size / self.settings.sample_rate_hz + 2,
-                    )
-                    if count != block_size:
-                        raise RuntimeError("Incomplete monitor capture")
-                    yield values.copy()
+                with stop_tasks(task):
+                    task.start()
+                    try:
+                        while not cancel_requested():
+                            yield self._read_samples(
+                                reader, block_size, cancel_requested=cancel_requested
+                            )
+                    except MeasurementCancelled:
+                        return
 
 
 class SimulatedHardware:
@@ -260,6 +379,7 @@ class SimulatedHardware:
         self.pressure_pa_per_output_v = pressure_pa_per_output_v
         self.noise_rms_v = noise_rms_v
         self.rng = np.random.default_rng(seed)
+        self._runtime = runtime_versions()
 
     def describe(self):
         return {
@@ -269,13 +389,22 @@ class SimulatedHardware:
             "pressure_pa_per_output_v": self.pressure_pa_per_output_v,
             "noise_rms_v": self.noise_rms_v,
             "daq": asdict(self.settings),
-            "runtime": runtime_versions(),
+            "runtime": dict(self._runtime),
         }
 
     def reset_output(self):
         pass
 
-    def acquire(self, sample_count):
+    def _emit_chunks(self, values, cancel_requested, on_chunk):
+        block_size = max(1, round(self.settings.sample_rate_hz * 0.02))
+        for first in range(0, len(values), block_size):
+            check_stop(cancel_requested)
+            if on_chunk is not None:
+                on_chunk(values[first : first + block_size].copy())
+        check_stop(cancel_requested)
+        return values
+
+    def acquire(self, sample_count, *, cancel_requested=None, on_chunk=None):
         values = self.rng.normal(0, self.noise_rms_v, sample_count)
         if self.reference_mode:
             t = np.arange(sample_count) / self.settings.sample_rate_hz
@@ -286,14 +415,31 @@ class SimulatedHardware:
                 * self.sensitivity_v_per_pa
                 * np.sin(2 * np.pi * self.reference_frequency_hz * t)
             )
-        return values
+        return self._emit_chunks(values, cancel_requested, on_chunk)
 
-    def play_and_record(self, output_v):
+    def play_and_record(self, output_v, *, cancel_requested=None, on_chunk=None):
         if np.max(np.abs(output_v)) > self.settings.max_peak_v * (1 + 1e-12):
             raise ValueError("Output exceeds max_peak_v")
-        return output_v * self.pressure_pa_per_output_v * self.sensitivity_v_per_pa + self.acquire(
-            len(output_v)
+        values = (
+            output_v * self.pressure_pa_per_output_v * self.sensitivity_v_per_pa
+            + self.acquire(len(output_v))
         )
+        return self._emit_chunks(values, cancel_requested, on_chunk)
+
+    def duplex(self, blocks, block_size, *, cancel_requested, total_samples=None):
+        with output_guard(self):
+            for block in blocks:
+                if cancel_requested():
+                    return
+                deadline = time.monotonic() + block_size / self.settings.sample_rate_hz
+                while time.monotonic() < deadline:
+                    if cancel_requested():
+                        return
+                    time.sleep(min(0.005, max(0, deadline - time.monotonic())))
+                yield {
+                    **block,
+                    "samples": self.play_and_record(block["output"]),
+                }
 
     def monitor(self, block_size, *, cancel_requested):
         with output_guard(self):
