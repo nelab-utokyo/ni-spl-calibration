@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.metadata
 import math
 import platform
+import time
 from contextlib import contextmanager
 from dataclasses import asdict
 from typing import Protocol
@@ -20,6 +21,7 @@ class Hardware(Protocol):
     def reset_output(self) -> None: ...
     def acquire(self, sample_count: int) -> np.ndarray: ...
     def play_and_record(self, output_v: np.ndarray) -> np.ndarray: ...
+    def monitor(self, block_size: int, *, cancel_requested): ...
 
 
 @contextmanager
@@ -39,7 +41,14 @@ def output_guard(hardware: Hardware):
 
 def runtime_versions() -> dict:
     versions = {"python": platform.python_version(), "platform": platform.system()}
-    for package in ("ni-spl-calibration", "numpy", "scipy", "soundfile", "nidaqmx"):
+    for package in (
+        "ni-spl-calibration",
+        "numpy",
+        "scipy",
+        "soundfile",
+        "nidaqmx",
+        "PySide6-Essentials",
+    ):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
@@ -197,6 +206,34 @@ class NIDaqHardware:
                 ao.wait_until_done(timeout=timeout)
                 return values
 
+    def monitor(self, block_size, *, cancel_requested):
+        """Read consecutive blocks from one continuous AI task; keep AO at 0 V."""
+        from nidaqmx.constants import AcquisitionType, TaskMode
+        from nidaqmx.stream_readers import AnalogSingleChannelReader
+
+        with output_guard(self):
+            with self._daq.Task() as task:
+                self._input(task)
+                task.timing.cfg_samp_clk_timing(
+                    self.settings.sample_rate_hz,
+                    sample_mode=AcquisitionType.CONTINUOUS,
+                    samps_per_chan=max(block_size * 20, 1000),
+                )
+                task.control(TaskMode.TASK_COMMIT)
+                self._check_rate(task)
+                reader = AnalogSingleChannelReader(task.in_stream)
+                values = np.empty(block_size)
+                task.start()
+                while not cancel_requested():
+                    count = reader.read_many_sample(
+                        values,
+                        number_of_samples_per_channel=block_size,
+                        timeout=block_size / self.settings.sample_rate_hz + 2,
+                    )
+                    if count != block_size:
+                        raise RuntimeError("Incomplete monitor capture")
+                    yield values.copy()
+
 
 class SimulatedHardware:
     """Synthetic linear speaker and microphone, for software checks only."""
@@ -257,3 +294,11 @@ class SimulatedHardware:
         return output_v * self.pressure_pa_per_output_v * self.sensitivity_v_per_pa + self.acquire(
             len(output_v)
         )
+
+    def monitor(self, block_size, *, cancel_requested):
+        with output_guard(self):
+            interval = block_size / self.settings.sample_rate_hz
+            while not cancel_requested():
+                time.sleep(interval)
+                if not cancel_requested():
+                    yield self.acquire(block_size)

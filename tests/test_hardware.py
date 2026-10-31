@@ -87,7 +87,7 @@ def fake_driver(monkeypatch, *, fail_read=False, coerce_rate=False):
         "nidaqmx": NS(Task=Task, DaqError=RuntimeError),
         "nidaqmx.system": NS(System=NS(local=lambda: system)),
         "nidaqmx.constants": NS(
-            AcquisitionType=NS(FINITE="finite"),
+            AcquisitionType=NS(FINITE="finite", CONTINUOUS="continuous"),
             TaskMode=NS(TASK_COMMIT="commit"),
             AOIdleOutputBehavior=NS(ZERO_VOLTS="zero"),
             TerminalConfiguration=NS(DIFF="diff", RSE="rse", NRSE="nrse", PSEUDO_DIFF="pseudo"),
@@ -129,3 +129,25 @@ def test_output_limit_is_checked_before_creating_tasks(monkeypatch):
     with pytest.raises(ValueError, match="exceeds"):
         hardware.play_and_record(np.array([0.6, 0.0]))
     assert events == []
+
+
+def test_continuous_monitor_reuses_one_ai_task_and_closes_before_reset(monkeypatch):
+    hardware, events = fake_driver(monkeypatch)
+    stream = hardware.monitor(100, cancel_requested=lambda: False)
+    first = next(stream)
+    second = next(stream)
+    assert first.shape == second.shape == (100,)
+    assert first is not second
+    assert events.count(("start", "ai")) == 1
+    assert not any(event == ("start", "ao") for event in events)
+    stream.close()
+    assert events[-3:] == [("close", "ai"), ("reset", 0.0), ("close", "ao")]
+
+
+def test_monitor_failure_or_coerced_rate_resets_output(monkeypatch):
+    for options in ({"fail_read": True}, {"coerce_rate": True}):
+        hardware, events = fake_driver(monkeypatch, **options)
+        stream = hardware.monitor(100, cancel_requested=lambda: False)
+        with pytest.raises(RuntimeError):
+            next(stream)
+        assert events[-3:] == [("close", "ai"), ("reset", 0.0), ("close", "ao")]

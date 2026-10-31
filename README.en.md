@@ -18,15 +18,53 @@ Use Git, Python 3.11 or later, and [uv](https://docs.astral.sh/uv/). Clone the r
 ```sh
 git clone https://github.com/kmraven/ni-spl-calibration.git
 cd ni-spl-calibration
-uv sync --locked --extra daq
-uv run ni-spl --help
+uv sync --locked --extra gui --extra daq
+uv run python -m ni_spl_calibration
 ```
 
 Physical hardware also requires the **NI-DAQmx driver** appropriate for your DAQ model and operating system. Installing the Python package alone is insufficient. See the [official NI documentation](https://nidaqmx-python.readthedocs.io/en/stable/). The hardware backend targets Windows/Linux environments supported by the driver.
 
-For pip, run `python -m pip install ".[daq]"` from the repository root. The repository includes `uv.lock` so uv can reproduce the dependency versions.
+For pip, run `python -m pip install ".[gui,daq]"` from the repository root. The repository includes `uv.lock` so uv can reproduce the dependency versions. API-only installations can omit the `gui` extra.
 
-## Commands and workflow
+## Desktop GUI
+
+**Launch the desktop GUI with Python.** Use the Python interpreter from the virtual environment where the package is installed:
+
+```sh
+python -m ni_spl_calibration
+```
+
+If uv manages your environment, run `uv run python -m ni_spl_calibration` from the repository root.
+
+The interface uses Japanese labels and starts in **simulation mode**. Select `NI DAQ 実機` at the top right for physical hardware.
+
+| Tab | Workflow |
+|---|---|
+| **1 設定 (Setup)** | Edit chain identity, AI/AO, common sample rate, voltage limits and all measurement parameters. Load/save setup YAML |
+| **2 マイク基準測定 (Microphone reference)** | Fit the calibrator, measure and save a reference, or load a compatible existing JSON |
+| **3 波形校正 (Waveform calibration)** | Remove the calibrator and position the microphone. Select WAV/NPZ/generator, preview the waveform and resampling, set the target and start calibration |
+| **4 履歴・再現 (History and restore)** | Restore conditions from successful, failed or cancelled runs, including runs saved elsewhere |
+| **5 マイクモニター (Microphone monitor)** | View live continuous AI, RMS/peak voltage and calibrated total SPL. Optionally save raw captures |
+
+Set the sample rate once in the setup tab. Measurement runs in a worker thread while the GUI displays iterations and levels. Stop or closing the window requests cooperative cancellation after the current finite acquisition, attempts to return AO to 0 V, and preserves completed iterations. It is not an immediate hardware cutoff. Every run receives a new output path. Changes to rate, hardware/input settings or backend require a compatible reference.
+
+### Records and reproducibility
+
+Before calibration, `run.json`, setup, reference and the exact playback samples are saved. Inputs and target level remain available on failure/cancellation. `checksums.json` records SHA-256 hashes of completed record files; restore verifies them.
+
+Select a run in History and click `選択した実行の条件を復元` to restore setup, backend, target, reference and saved stimulus. The original WAV or generator is unnecessary: restoration uses `stimulus.npz`, without rerunning random generators. Restore does not start hardware. Starting calibration then creates a new output bundle that links back to its parent run. Reproducing digital inputs does not reproduce physical room conditions or equipment state; verify the recorded gain, equipment and geometry before measurement. Older successful bundles can also be restored when all input snapshots exist, using internal consistency checks because they lack file-level hashes.
+
+GUI operation starts, completion, failures, stop requests and setup/reference file loads/saves are recorded as timestamped JSON events under `sessions/<session ID>/events/`. Preview waveforms are also saved in that session. Open the activity folder using `操作ログを開く`. The log captures complete conditions at operation start rather than individual keystrokes.
+
+### Live microphone monitoring
+
+In the monitor tab, click `モニターを開始`. The display updates approximately every 100 ms, showing the latest second at the common setup rate. Without a valid reference, voltage is shown. With a valid reference, SPL is **total input pressure including background**, within the configured band; it differs from calibration's background-subtracted signal level. Clipping is flagged and the frame's SPL is not reported.
+
+AO stays at 0 V. Monitoring and reference/calibration tasks are mutually exclusive. Use Stop before continuing measurements.
+
+Each `monitor-<timestamp>/` folder stores setup, reference, hardware information, `levels.jsonl` and a final `summary.json` (or a failure record). Raw input recording is enabled by default. Consecutive `capture-*.npz` files contain `samples` in volts, `sample_rate_hz` and `first_sample`; their SHA-256 hashes are recorded in the level log. Disabling raw captures still preserves the level time series and activity log.
+
+## Using commands
 
 The usual flow is **configure → measure the microphone reference → calibrate each waveform → play the saved waveform in your experiment**.
 
@@ -59,7 +97,7 @@ After changing the rate, measure a new reference and recalibrate the stimulus. S
 Run the following from the repository root. The `results/` directory is excluded from Git.
 
 ```sh
-uv sync --locked --extra dev
+uv sync --locked --extra gui --extra dev
 uv run ni-spl reference examples/setup.yaml --output results/demo-reference.json --simulate --yes
 uv run ni-spl calibrate examples/setup.yaml --reference results/demo-reference.json --generator examples/custom_sound.py:make_sound --parameters examples/parameters.yaml --target-spl-db 70 --output results/demo-am --simulate --yes
 uv run pytest
@@ -138,6 +176,8 @@ The output directory contains:
 | `result.json` | Voltage scale, measured SPL, output RMS/peak voltage, complete search history, setup, reference, and hardware/library information |
 | `stimulus.npz` | Losslessly saved waveform used in the search (after WAV conversion, if any), sample rate, source and conversion information |
 | `setup.json` / `reference.json` | Snapshots of the configuration and reference measurement |
+| `run.json` | Inputs, target level, backend, waveform hash and parent run, saved before measurement |
+| `checksums.json` | SHA-256 hashes of completed record files, verified when restoring |
 | `failure.json` | Failure reason and available search history; no success record is created on failure |
 
 ```python
@@ -165,4 +205,4 @@ The output is constrained by a peak-voltage limit and upward search steps of at 
 
 Reference records are tied to the setup identity and DAQ configuration. Detected changes require a new reference measurement. Physical changes such as gain or wiring changes cannot be detected automatically; update `chain_notes`. Recalibrate the stimuli after changing the speaker, microphone position/orientation, room conditions, or other material parts of the acoustic path. JSON/NPZ records are never overwritten, preserving earlier calibrations.
 
-Automated tests cover reference sensitivity, level searches including AM sounds, frequency bands, time windows and delays, output limits, SNR, clipping, record reuse, and the CLI workflow. **Physical NI DAQ validation had not been performed when this repository was created.** At the receiving setup, first use a known reference signal and a low output level to check clock routing, input configuration, return to 0 V, and measured levels.
+Automated tests cover reference sensitivity, level searches including AM sounds, frequency bands, windows and delays, output limits, SNR, clipping, GUI operations/restoration/cancellation/live monitoring, record integrity and the CLI workflow. GUI tests require the `gui` extra; use `QT_QPA_PLATFORM=offscreen uv run pytest` in headless environments. **Physical NI DAQ validation has not been performed.** At the receiving setup, first use a known reference signal and a low output level to check clock routing, input configuration, return to 0 V, and measured levels.

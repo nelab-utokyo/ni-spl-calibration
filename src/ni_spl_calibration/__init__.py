@@ -3,6 +3,7 @@
 from .calibration import (
     CalibrationError,
     CalibrationResult,
+    MeasurementCancelled,
     Reference,
     apply_calibration,
     calibrate,
@@ -17,6 +18,7 @@ from .stimulus import Stimulus, from_generator, load_stimulus, load_wav, save_st
 __all__ = [
     "CalibrationError",
     "CalibrationResult",
+    "MeasurementCancelled",
     "Reference",
     "apply_calibration",
     "calibrate",

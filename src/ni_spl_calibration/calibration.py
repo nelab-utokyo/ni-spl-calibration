@@ -60,6 +60,15 @@ class CalibrationError(RuntimeError):
         self.iterations = list(iterations)
 
 
+class MeasurementCancelled(CalibrationError):
+    """A cooperative stop requested between finite hardware operations."""
+
+
+def _check_cancelled(cancel_requested, iterations=()):
+    if cancel_requested is not None and cancel_requested():
+        raise MeasurementCancelled("Measurement cancelled", iterations)
+
+
 @dataclass(frozen=True)
 class CalibrationResult:
     calibrated_at: str
@@ -113,16 +122,21 @@ def validate_reference(setup: Setup, reference: Reference, hardware: Hardware | 
         raise ValueError("Hardware DAQ settings differ from the setup")
 
 
-def measure_reference(setup: Setup, *, hardware: Hardware | None = None) -> Reference:
+def measure_reference(
+    setup: Setup, *, hardware: Hardware | None = None, cancel_requested=None
+) -> Reference:
+    _check_cancelled(cancel_requested)
     hardware = hardware if hardware is not None else NIDaqHardware(setup.daq)
     if hardware.settings != setup.daq:
         raise ValueError("Hardware DAQ settings differ from the setup")
     fs = setup.daq.sample_rate_hz
     count = round(setup.reference_duration_s * fs)
     with output_guard(hardware):
+        _check_cancelled(cancel_requested)
         values = validate_capture(
             hardware.acquire(count), count, setup.daq, setup.measurement.input_clip_fraction
         )
+        _check_cancelled(cancel_requested)
         frequencies = np.fft.rfftfreq(count, 1 / fs)
         spectrum = np.abs(np.fft.rfft((values - np.mean(values)) * np.hanning(count)))
         spectrum[0] = 0
@@ -162,6 +176,7 @@ def measure_reference(setup: Setup, *, hardware: Hardware | None = None) -> Refe
         if span > setup.reference_max_span_db:
             raise RuntimeError(f"Acoustic reference is unstable ({span:.3f} dB span)")
         pressure = 20e-6 * 10 ** (setup.reference_level_db / 20)
+        _check_cancelled(cancel_requested)
         return Reference(
             timestamp(),
             setup.reference_fingerprint,
@@ -202,12 +217,14 @@ def calibrate(
     target_spl_db: float,
     hardware: Hardware | None = None,
     on_iteration=None,
+    cancel_requested=None,
 ) -> CalibrationResult:
     """Find volts per digital unit. Measure the exact same waveform each time."""
     if not math.isfinite(target_spl_db) or not -100 <= target_spl_db <= 180:
         raise ValueError("target_spl_db must be finite and between -100 and 180")
     first, last, delay = measurement_bounds(stimulus, setup)
     validate_reference(setup, reference)
+    _check_cancelled(cancel_requested)
     hardware = hardware if hardware is not None else NIDaqHardware(setup.daq)
     validate_reference(setup, reference, hardware)
     settings = setup.measurement
@@ -219,12 +236,14 @@ def calibrate(
     fs = stimulus.sample_rate_hz
     try:
         with output_guard(hardware):
+            _check_cancelled(cancel_requested, history)
             count = last - first
             background = validate_capture(
                 hardware.acquire(count), count, setup.daq, settings.input_clip_fraction
             )
             background_power = band_power(background, fs, settings)
             for number in range(1, settings.max_iterations + 1):
+                _check_cancelled(cancel_requested, history)
                 # Include the delayed acoustic tail and a final 0 V sample.
                 output = np.concatenate((stimulus.samples * scale, np.zeros(delay + 1)))
                 samples = validate_capture(
@@ -269,6 +288,7 @@ def calibrate(
                 history.append(item)
                 if on_iteration is not None:
                     on_iteration(dict(item))
+                _check_cancelled(cancel_requested, history)
                 if error is not None and abs(error) <= settings.tolerance_db:
                     confirmations += 1
                     if confirmations >= settings.confirmations:

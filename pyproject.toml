@@ -8,6 +8,7 @@ dependencies = ["numpy>=1.26", "scipy>=1.12", "soundfile>=0.12", "PyYAML>=6.0"]
 
 [project.optional-dependencies]
 daq = ["nidaqmx>=1.0"]
+gui = ["PySide6-Essentials>=6.8"]
 dev = ["pytest>=8.2", "ruff>=0.12"]
 
 [project.scripts]

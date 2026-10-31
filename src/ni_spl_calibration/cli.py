@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
-import importlib.util
 import json
 import sys
 from dataclasses import asdict
@@ -10,22 +8,22 @@ from pathlib import Path
 
 import yaml
 
-from .calibration import (
-    calibrate,
-    load_reference,
-    measure_reference,
-    measurement_bounds,
-    validate_reference,
-)
+from .calibration import load_reference, measurement_bounds, validate_reference
 from .config import DEFAULT_SAMPLE_RATE_HZ, Setup, load_setup
-from .hardware import NIDaqHardware, SimulatedHardware
-from .stimulus import from_generator, load_stimulus, load_wav, save_stimulus
-from .storage import write_json
+from .workflow import (
+    StimulusSource,
+    calibrate_to_directory,
+    make_hardware,
+    measure_reference_to_file,
+)
 
 
 def parser():
-    root = argparse.ArgumentParser(description="Calibrate finite mono waveforms with an NI DAQ")
-    commands = root.add_subparsers(dest="command", required=True)
+    root = argparse.ArgumentParser(
+        description="NI SPL Calibration. Launch the desktop GUI when no command is supplied."
+    )
+    commands = root.add_subparsers(dest="command")
+    commands.add_parser("gui", help="Open the desktop application (default)")
     init = commands.add_parser("init", help="Write an unmeasured setup template")
     init.add_argument("output", type=Path)
     inspect = commands.add_parser("inspect", help="Inspect a waveform without accessing hardware")
@@ -75,60 +73,12 @@ def _hardware_arguments(command):
 
 
 def _stimulus(args, sample_rate_hz=None):
-    if args.parameters and not args.generator:
-        raise ValueError("--parameters requires --generator")
-    if args.wav:
-        return load_wav(args.wav, sample_rate_hz=sample_rate_hz)
-    if args.npz:
-        stimulus = load_stimulus(args.npz)
-        if sample_rate_hz is not None and stimulus.sample_rate_hz != sample_rate_hz:
-            raise ValueError(
-                "Saved stimulus and DAQ/target sample rates differ; NPZ is never resampled. "
-                "Use the original WAV/generator to recalibrate at the new setup rate."
-            )
-        return stimulus
-    parameters = {}
-    if args.parameters:
-        parameters = yaml.safe_load(args.parameters.read_text(encoding="utf-8"))
-        if not isinstance(parameters, dict):
-            raise ValueError("Generator parameters must be a YAML mapping")
-        if "sample_rate_hz" in parameters:
-            raise ValueError(
-                "Set sample_rate_hz in setup.daq, not in generator parameters "
-                "(standalone inspect also accepts --sample-rate-hz)"
-            )
-    module_name, separator, function_name = args.generator.rpartition(":")
-    if not separator or not module_name or not function_name:
-        raise ValueError("Use --generator module:function or file.py:function")
-    if module_name.endswith(".py"):
-        path = Path(module_name)
-        spec = importlib.util.spec_from_file_location("_ni_spl_user_generator", path)
-        if spec is None or spec.loader is None:
-            raise ValueError("Cannot import generator file")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-    else:
-        module = importlib.import_module(module_name)
-    function = getattr(module, function_name)
-    if not callable(function):
-        raise ValueError("Generator must be callable")
-    return from_generator(
-        function,
-        sample_rate_hz=DEFAULT_SAMPLE_RATE_HZ if sample_rate_hz is None else sample_rate_hz,
-        **parameters,
-    )
+    kind = next(name for name in ("wav", "npz", "generator") if getattr(args, name))
+    return StimulusSource(kind, str(getattr(args, kind)), args.parameters).prepare(sample_rate_hz)
 
 
 def _hardware(args, setup, reference_mode=False):
-    if args.simulate:
-        return SimulatedHardware(
-            setup.daq,
-            reference_mode=reference_mode,
-            reference_frequency_hz=setup.reference_frequency_hz,
-            reference_level_db=setup.reference_level_db,
-        )
-    return NIDaqHardware(setup.daq)
+    return make_hardware(setup, simulate=args.simulate, reference_mode=reference_mode)
 
 
 def _confirm(args, setup, stimulus=None):
@@ -187,8 +137,7 @@ def _run(args):
         raise FileExistsError(f"Output already exists: {args.output}")
     if args.command == "reference":
         _confirm(args, setup)
-        reference = measure_reference(setup, hardware=_hardware(args, setup, reference_mode=True))
-        write_json(args.output, reference)
+        measure_reference_to_file(setup, args.output, simulate=args.simulate)
         print(f"Saved reference: {args.output}")
         return
     reference = load_reference(args.reference)
@@ -198,39 +147,24 @@ def _run(args):
     _confirm(args, setup, stimulus)
     hardware = _hardware(args, setup)
     validate_reference(setup, reference, hardware)
-    args.output.mkdir(parents=True, exist_ok=False)
-    save_stimulus(stimulus, args.output / "stimulus.npz")
-    write_json(args.output / "setup.json", asdict(setup))
-    write_json(args.output / "reference.json", reference)
-    try:
-        result = calibrate(
-            stimulus,
-            setup=setup,
-            reference=reference,
-            target_spl_db=args.target_spl_db,
-            hardware=hardware,
-            on_iteration=_iteration,
-        )
-    except (Exception, KeyboardInterrupt) as error:
-        write_json(
-            args.output / "failure.json",
-            {
-                "schema_version": 1,
-                "status": "failed",
-                "error": str(error) or "Interrupted",
-                "notes": getattr(error, "__notes__", []),
-                "iterations": getattr(error, "iterations", []),
-                "stimulus": stimulus.describe(),
-                "hardware": hardware.describe(),
-            },
-        )
-        raise
-    write_json(args.output / "result.json", result)
+    result = calibrate_to_directory(
+        stimulus,
+        setup=setup,
+        reference=reference,
+        target_spl_db=args.target_spl_db,
+        output=args.output,
+        hardware=hardware,
+        on_iteration=_iteration,
+    )
     print(f"Saved {args.output / 'result.json'}; scale = {result.scale_v:.8g} V/digital unit")
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.command in (None, "gui"):
+        from .gui import main as gui_main
+
+        return gui_main()
     try:
         _run(args)
     except KeyboardInterrupt as error:
