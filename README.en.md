@@ -83,7 +83,7 @@ Preview emits no audio; standalone microphone monitoring holds AO at 0 V. Use Te
 
 ### Choose the initial calibration level
 
-`start_scale_v` is the initial **volts per digital unit**. The first peak voltage is `min(start_scale_v * waveform_peak, max_peak_v)`. For example, a waveform peak of 0.5 and an initial scale of 0.01 produce 0.005 Vpeak. Waveform calibration displays this initial Vpeak.
+`start_scale_v` is the initial **volts per digital unit**. The first peak voltage is `min(start_scale_v * selected_interval_peak, max_peak_v)`. For example, a selected interval peak of 0.5 and an initial scale of 0.01 produce 0.005 Vpeak. Waveform calibration displays this initial Vpeak.
 
 To choose it using playback:
 
@@ -91,6 +91,8 @@ To choose it using playback:
 2. Start low and adjust the fader while watching the input and SPL. Use a level below the target without clipping the microphone input as a starting point.
 3. Click **Use this volume to start calibration**. Playback stops before the applied gain is saved as the initial scale and Waveform calibration opens. Muted or clipped frames and pending fader changes cannot be adopted. The exact prepared waveform is retained, and the selected gain and source playback record are logged.
 4. Check the initial Vpeak, set the target and start calibration. Test playback's total SPL is a guide; the calibration search checks SNR against a separate background measurement.
+
+Test playback uses the full source waveform. The adopted value is volts per digital unit; calibration's initial Vpeak is calculated from the selected interval. If that interval has a lower peak than the full waveform, its initial Vpeak is also lower than the test playback display.
 
 The iteration table also displays SNR. Insufficient SNR continues the search with bounded upward steps. The default for new setups and the allowed maximum are **10 dB per step** (approximately 3.16 times the voltage). The peak-voltage limit still applies. If SNR remains insufficient at that limit, increasing only the initial scale will not help; check the microphone input, gain and analysis band. Existing setup files and restored runs retain their saved step size.
 
@@ -190,6 +192,8 @@ measurement:
   acoustic_delay_s: 0.0  # Acoustic/equipment delay relative to AO; measure if needed
 ```
 
+Calibration plays and analyzes only the interval from `start_s` to `stop_s`. Start 0 s and stop 15 s plays 15 seconds; start 5 s and stop 15 s plays 10 seconds. Acquisition then continues with zero output for the configured acoustic delay plus one final 0 V sample. Background is acquired before playback for the same duration as the selected interval.
+
 - Including silence or ramps changes the measured level. For AM sounds, select an interval containing enough modulation cycles. For short sounds, check the delay and measurement window carefully.
 - FFT-bin powers are integrated to obtain the energy average over the entire interval. The calculation does not use a median of block RMS values or an arithmetic average of dB values. The rectangular measurement window introduces spectral leakage and frequency-resolution limitations near band boundaries.
 - Intentional AM variation is not classified as instability. Instead, the level over the whole measurement interval must fall within the target tolerance at least twice at the same voltage scale.
@@ -204,7 +208,7 @@ The output directory contains:
 | File | Contents |
 |---|---|
 | `result.json` | Voltage scale, measured SPL, output RMS/peak voltage, complete search history, setup, reference, and hardware/library information |
-| `stimulus.npz` | Losslessly saved waveform used in the search (after WAV conversion, if any), sample rate, source and conversion information |
+| `stimulus.npz` | Losslessly saved full source waveform (after WAV conversion, if any), sample rate, source and conversion information. The playback interval is stored in `setup.json` |
 | `setup.json` / `reference.json` | Snapshots of the configuration and reference measurement |
 | `run.json` | Inputs, target level, backend, waveform hash and parent run, saved before measurement |
 | `checksums.json` | SHA-256 hashes of completed record files, verified when restoring |
@@ -221,7 +225,7 @@ output_v = apply_calibration(stimulus, result)
 # output_v is in volts. Do not apply another gain or normalization.
 ```
 
-`scale_v` is volts per digital unit; the playback voltage is `samples * scale_v`. `apply_calibration` checks the waveform/sample-rate hash and voltage limit. The returned array has the same length as the source waveform, so your own playback implementation must also return AO to 0 V at the end.
+`scale_v` is volts per digital unit. `apply_calibration` selects the interval using the saved start and stop times, applies the scale, and checks the waveform/sample-rate hash and voltage limit. The returned array contains only the calibrated interval, without delay padding or a final 0 V sample. Your own playback implementation must return AO to 0 V at the end.
 
 From Python, pass `Stimulus(samples, setup.daq.sample_rate_hz)`, `load_wav(path, sample_rate_hz=setup.daq.sample_rate_hz)`, or `from_generator(fn, sample_rate_hz=setup.daq.sample_rate_hz, ...)` to `calibrate(...)`. Omitting the rate in `load_wav(path)` preserves the original WAV. After calibration, use the saved `stimulus.npz` for playback. DAQ operations are separated into `NIDaqHardware`; tests can use `SimulatedHardware`. See [examples/python_api.py](examples/python_api.py) for a complete example.
 

@@ -205,7 +205,9 @@ class NIDaqHardware:
             from nidaqmx.constants import RegenerationMode
 
             ao.out_stream.regen_mode = RegenerationMode.DONT_ALLOW_REGENERATION
-            ao.out_stream.output_buf_size = buffer_size
+        # AO timing sets the generation length, not the host buffer size.
+        # Allocate before COMMIT to avoid -201025 on devices such as USB-6361.
+        ao.out_stream.output_buf_size = sample_count if buffer_size is None else buffer_size
         ao.control(TaskMode.TASK_COMMIT)
         self._check_rate(ao)
         ai.control(TaskMode.TASK_COMMIT)

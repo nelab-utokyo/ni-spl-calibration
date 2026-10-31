@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 
 from .calibration import (
     MeasurementCancelled,
+    _window_bounds,
     load_reference,
     measurement_bounds,
     validate_reference,
@@ -233,7 +234,7 @@ class SetupEditor(QScrollArea):
         )
         layout.addWidget(
             self._section(
-                "測定する区間・帯域",
+                "再生・測定する区間・帯域",
                 [
                     ("measurement.start_s", "開始時刻 [s]", "float"),
                     ("measurement.stop_s", "終了時刻 [s]・空欄で末尾まで", "optional_float"),
@@ -265,6 +266,11 @@ class SetupEditor(QScrollArea):
         )
         bind(self.fields["measurement.band_hz"], "setPlaceholderText", "例: [5000, 80000]")
         bind(
+            self.fields["measurement.stop_s"],
+            "setToolTip",
+            "校正では指定した開始～終了時刻の区間だけを再生・解析します。",
+        )
+        bind(
             self.fields["measurement.frequency_correction_db"],
             "setPlaceholderText",
             "例: [[0, 0], [1000, 0], [100000, -2.0]]",
@@ -272,7 +278,7 @@ class SetupEditor(QScrollArea):
         bind(
             self.fields["measurement.start_scale_v"],
             "setToolTip",
-            "探索開始時のV/デジタル値です。初回Vpeakは初期倍率×波形のピークで、出力上限を超えません。テスト再生の音量から設定できます。",
+            "探索開始時のV/デジタル値です。初回Vpeakは初期倍率×選択区間のピークで、出力上限を超えません。テスト再生の音量から設定できます。",
         )
         layout.addStretch()
         self.setWidget(content)
@@ -519,6 +525,7 @@ class CalibrationWindow(QMainWindow):
         self.reference = None
         self.stimulus = None
         self._stimulus_info = None
+        self._window_peak_cache = None
         self.last_output = None
         self.last_monitor_output = None
         self._closing = False
@@ -1115,6 +1122,11 @@ class CalibrationWindow(QMainWindow):
             and (self.worker is None or self.job_kind == "test_playback")
             and math.isclose(choice["volume_fraction"], self.volume_control.get(), abs_tol=1e-12)
         )
+        if available:
+            try:
+                self._selected_waveform_peak(self.editor.setup())
+            except (ValueError, TypeError):
+                available = False
         self.adopt_start_button.setEnabled(available)
 
     def _use_playback_as_start(self):
@@ -1142,7 +1154,10 @@ class CalibrationWindow(QMainWindow):
             raise ValueError(
                 translate(self, "波形または設定が変わっています。テスト再生で再確認してください。")
             )
-        self._audit("start_level_selected", **choice)
+        initial_peak = min(
+            choice["scale_v"] * self._selected_waveform_peak(setup), setup.daq.max_peak_v
+        )
+        self._audit("start_level_selected", **choice, initial_peak_v=initial_peak)
         field = self.editor.fields["measurement.start_scale_v"]
         blocker = QSignalBlocker(field)
         field.setText(repr(choice["scale_v"]))
@@ -1156,7 +1171,7 @@ class CalibrationWindow(QMainWindow):
         set_text(
             self.status,
             "探索開始を {peak:.6g} Vpeak（倍率 {scale:.6g} V/デジタル値）に設定しました。目標音圧を指定して校正を開始してください。",
-            peak=choice["peak_v"],
+            peak=initial_peak,
             scale=choice["scale_v"],
         )
 
@@ -1665,6 +1680,17 @@ class CalibrationWindow(QMainWindow):
             )
         self._update_start_level_info()
 
+    def _selected_waveform_peak(self, setup):
+        settings = setup.measurement
+        if settings.start_s == 0 and settings.stop_s is None:
+            return self._stimulus_info["digital_peak"]
+        key = (self._stimulus_info["sha256"], settings.start_s, settings.stop_s)
+        if self._window_peak_cache is None or self._window_peak_cache[0] != key:
+            first, last = _window_bounds(self.stimulus, settings)
+            peak = float(np.max(np.abs(self.stimulus.samples[first:last])))
+            self._window_peak_cache = (key, peak)
+        return self._window_peak_cache[1]
+
     def _update_start_level_info(self):
         if self.stimulus is None:
             set_text(
@@ -1673,13 +1699,13 @@ class CalibrationWindow(QMainWindow):
             return
         try:
             setup = self.editor.setup()
+            peak = self._selected_waveform_peak(setup)
         except (ValueError, TypeError):
             set_text(self.start_level_info, "設定の入力を確認してください。")
             return
-        peak = self._stimulus_info["digital_peak"]
         set_text(
             self.start_level_info,
-            "探索開始: {voltage:.6g} Vpeak（初期倍率 {scale:.6g} × 波形ピーク {peak:.6g}、上限 {limit:.6g} Vpeak）。テスト再生の音量から開始値を選べます。",
+            "探索開始: {voltage:.6g} Vpeak（初期倍率 {scale:.6g} × 選択区間のピーク {peak:.6g}、上限 {limit:.6g} Vpeak）。テスト再生の音量から開始値を選べます。",
             voltage=min(setup.measurement.start_scale_v * peak, setup.daq.max_peak_v),
             scale=setup.measurement.start_scale_v,
             peak=peak,
@@ -1792,6 +1818,7 @@ class CalibrationWindow(QMainWindow):
                     output=output,
                     hardware=hardware,
                     on_iteration=progress,
+                    on_phase=progress,
                     cancel_requested=cancelled,
                     parent_run=parent_run,
                     on_samples=meter.push,
@@ -1865,6 +1892,30 @@ class CalibrationWindow(QMainWindow):
             return
         if item.get("kind") == "test_playback":
             self._playback_frame(item)
+            return
+        if item.get("kind") == "calibration_phase":
+            if self.worker is None or self.worker.cancel_event.is_set():
+                return
+            phase = item["phase"]
+            if phase == "saving":
+                set_text(self.status, "再生波形と測定条件を保存中…（この間は無音です）")
+            elif phase == "background":
+                set_text(
+                    self.status,
+                    "背景音を測定中：{duration:g} 秒（AOは0 V・まだ再生していません）",
+                    duration=item["duration_s"],
+                )
+            else:
+                set_text(
+                    self.status,
+                    "再生中：{iteration}/{maximum} 回目 · 区間 {start:g}～{stop:g} 秒 · 再生 {duration:.3f} 秒 · 出力 {peak:.4g} Vpeak",
+                    iteration=item["iteration"],
+                    maximum=item["max_iterations"],
+                    start=item["start_s"],
+                    stop=item["stop_s"],
+                    duration=item["duration_s"],
+                    peak=item["output_peak_v"],
+                )
             return
         if item.get("kind") == "monitor":
             self._monitor_frame(item)

@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .analysis import band_power, tone_rms, validate_capture
-from .config import Setup
+from .config import MeasurementSettings, Setup
 from .errors import CalibrationError, MeasurementCancelled
 from .hardware import Hardware, NIDaqHardware, output_guard
 from .stimulus import Stimulus
@@ -193,12 +193,7 @@ def measure_reference(
         )
 
 
-def measurement_bounds(stimulus: Stimulus, setup: Setup) -> tuple[int, int, int]:
-    if stimulus.sample_rate_hz != setup.daq.sample_rate_hz:
-        raise ValueError(
-            "Stimulus and DAQ sample rates differ; resample explicitly and recalibrate"
-        )
-    settings = setup.measurement
+def _window_bounds(stimulus: Stimulus, settings: MeasurementSettings) -> tuple[int, int]:
     fs = stimulus.sample_rate_hz
     duration = len(stimulus.samples) / fs
     stop = duration if settings.stop_s is None else settings.stop_s
@@ -207,6 +202,19 @@ def measurement_bounds(stimulus: Stimulus, setup: Setup) -> tuple[int, int, int]
     first, last = round(settings.start_s * fs), round(stop * fs)
     if last - first < 16:
         raise ValueError("Measurement window must contain at least 16 samples")
+    if np.std(stimulus.samples[first:last]) <= np.finfo(float).eps:
+        raise ValueError("Selected measurement window is silent or constant")
+    return first, last
+
+
+def measurement_bounds(stimulus: Stimulus, setup: Setup) -> tuple[int, int, int]:
+    if stimulus.sample_rate_hz != setup.daq.sample_rate_hz:
+        raise ValueError(
+            "Stimulus and DAQ sample rates differ; resample explicitly and recalibrate"
+        )
+    settings = setup.measurement
+    fs = stimulus.sample_rate_hz
+    first, last = _window_bounds(stimulus, settings)
     # Preflight bin selection and response-curve coverage before any hardware access.
     band_power(np.zeros(last - first), fs, settings)
     return first, last, round(settings.acoustic_delay_s * fs)
@@ -220,19 +228,21 @@ def calibrate(
     target_spl_db: float,
     hardware: Hardware | None = None,
     on_iteration=None,
+    on_phase=None,
     cancel_requested=None,
     on_samples=None,
 ) -> CalibrationResult:
-    """Find volts per digital unit. Measure the exact same waveform each time."""
+    """Find volts per digital unit by playing only the selected source interval."""
     if not math.isfinite(target_spl_db) or not -100 <= target_spl_db <= 180:
         raise ValueError("target_spl_db must be finite and between -100 and 180")
     first, last, delay = measurement_bounds(stimulus, setup)
     validate_reference(setup, reference)
     _check_cancelled(cancel_requested)
+    selected = stimulus.samples[first:last]
     hardware = hardware if hardware is not None else NIDaqHardware(setup.daq)
     validate_reference(setup, reference, hardware)
     settings = setup.measurement
-    peak = float(np.max(np.abs(stimulus.samples)))
+    peak = float(np.max(np.abs(selected)))
     maximum_scale = setup.daq.max_peak_v / peak
     scale = min(settings.start_scale_v, maximum_scale)
     history = []
@@ -242,6 +252,10 @@ def calibrate(
         with output_guard(hardware):
             _check_cancelled(cancel_requested, history)
             count = last - first
+            if on_phase is not None:
+                on_phase(
+                    {"kind": "calibration_phase", "phase": "background", "duration_s": count / fs}
+                )
             background = validate_capture(
                 _capture(hardware.acquire, count, cancel_requested, on_samples),
                 count,
@@ -252,14 +266,27 @@ def calibrate(
             for number in range(1, settings.max_iterations + 1):
                 _check_cancelled(cancel_requested, history)
                 # Include the delayed acoustic tail and a final 0 V sample.
-                output = np.concatenate((stimulus.samples * scale, np.zeros(delay + 1)))
+                output = np.concatenate((selected * scale, np.zeros(delay + 1)))
+                if on_phase is not None:
+                    on_phase(
+                        {
+                            "kind": "calibration_phase",
+                            "phase": "playback",
+                            "duration_s": len(output) / fs,
+                            "start_s": first / fs,
+                            "stop_s": last / fs,
+                            "iteration": number,
+                            "max_iterations": settings.max_iterations,
+                            "output_peak_v": scale * peak,
+                        }
+                    )
                 samples = validate_capture(
                     _capture(hardware.play_and_record, output, cancel_requested, on_samples),
                     len(output),
                     setup.daq,
                     settings.input_clip_fraction,
                 )
-                captured = samples[first + delay : last + delay]
+                captured = samples[delay : count + delay]
                 measured_power = band_power(captured, fs, settings)
                 signal_power = max(0.0, measured_power - background_power)
                 snr = (
@@ -305,7 +332,7 @@ def calibrate(
                             measured_spl_db=level,
                             scale_v=scale,
                             output_peak_v=scale * peak,
-                            output_rms_v=scale * float(np.sqrt(np.mean(stimulus.samples**2))),
+                            output_rms_v=scale * float(np.sqrt(np.mean(selected**2))),
                             stimulus=stimulus.describe(),
                             setup=asdict(setup),
                             reference=asdict(reference),
@@ -339,10 +366,11 @@ def calibrate(
 
 
 def apply_calibration(stimulus: Stimulus, result: CalibrationResult) -> np.ndarray:
-    """Return volts for the exact calibrated waveform, without adding padding."""
+    """Return volts for the calibrated source interval, without adding padding."""
     if stimulus.sha256 != result.stimulus["sha256"]:
         raise ValueError("Waveform/sample rate changed; recalibrate this stimulus")
-    output = stimulus.samples * result.scale_v
+    first, last = _window_bounds(stimulus, MeasurementSettings(**result.setup["measurement"]))
+    output = stimulus.samples[first:last] * result.scale_v
     if np.max(np.abs(output)) > result.setup["daq"]["max_peak_v"] * (1 + 1e-12):
         raise ValueError("Calibrated waveform exceeds the stored peak-voltage limit")
     return output

@@ -8,9 +8,12 @@ from ni_spl_calibration import (
     CalibrationError,
     DaqSettings,
     MeasurementCancelled,
+    MeasurementSettings,
     Setup,
     SimulatedHardware,
     Stimulus,
+    apply_calibration,
+    load_result,
     measure_reference,
 )
 from ni_spl_calibration.records import find_runs, load_replay
@@ -18,8 +21,13 @@ from ni_spl_calibration.storage import read_json
 from ni_spl_calibration.workflow import calibrate_to_directory
 
 
-def make_bundle(directory, target=70):
-    setup = Setup("record-test", "Fixed measurement chain", daq=DaqSettings(sample_rate_hz=20000))
+def make_bundle(directory, target=70, *, measurement=None):
+    setup = Setup(
+        "record-test",
+        "Fixed measurement chain",
+        daq=DaqSettings(sample_rate_hz=20000),
+        measurement=measurement or MeasurementSettings(),
+    )
     stimulus = Stimulus(0.4 * np.sin(2 * np.pi * 2000 * np.arange(4000) / 20000), 20000)
     reference = measure_reference(setup, hardware=SimulatedHardware(setup.daq, reference_mode=True))
     return calibrate_to_directory(
@@ -71,6 +79,17 @@ def test_legacy_successful_bundle_can_be_restored(tmp_path):
     (directory / "setup.json").write_text(json.dumps(setup))
     with pytest.raises(ValueError):
         load_replay(directory)
+
+
+def test_saved_run_preserves_source_but_replays_only_calibrated_interval(tmp_path):
+    directory = tmp_path / "selected-interval"
+    make_bundle(directory, measurement=MeasurementSettings(start_s=0.05, stop_s=0.1))
+    replay = load_replay(directory)
+    result = load_result(directory / "result.json")
+    assert len(replay.stimulus.samples) == 4000
+    output = apply_calibration(replay.stimulus, result)
+    assert len(output) == 1000
+    np.testing.assert_array_equal(output, replay.stimulus.samples[1000:2000] * result.scale_v)
 
 
 def test_reference_cooperative_stop_resets_output():

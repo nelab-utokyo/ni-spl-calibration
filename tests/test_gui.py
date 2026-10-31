@@ -211,6 +211,10 @@ def test_stop_or_close_during_capture_preserves_history_and_resets_output(
     view.calibrate_button.click()
     try:
         wait_until(app, entered.is_set)
+        assert "再生中：" in view.status.text()
+        view.language.setCurrentIndex(1)
+        assert view.status.text().startswith("Playing:")
+        view.language.setCurrentIndex(0)
         directory = view.job_output
         if close_window:
             view.close()
@@ -433,12 +437,26 @@ def test_built_in_tone_selection_and_one_shot_test_playback(window, app):
     assert view.monitor_spectrum.spectrum is not None
 
 
-def test_playback_volume_is_applied_to_the_first_calibration_output(window, app):
+@pytest.mark.parametrize("windowed", [False, True])
+def test_playback_volume_is_applied_to_the_first_calibration_output(
+    window, app, tmp_path, windowed
+):
     view, _ = window
     view.measure_button.click()
     wait_until(app, lambda: view.worker is None)
     reference = view.reference
-    view._choose_test_tone()
+    if windowed:
+        rate = view.editor.setup().daq.sample_rate_hz
+        samples = 0.8 * np.sin(2 * np.pi * 1000 * np.arange(rate) / rate)
+        samples[rate // 4 : 3 * rate // 4] *= 0.25
+        path = tmp_path / "varying-level.wav"
+        sf.write(path, samples, rate, subtype="DOUBLE")
+        view.editor.fields["measurement.start_s"].setText("0.25")
+        view.editor.fields["measurement.stop_s"].setText("0.75")
+        view.source_location.setText(str(path))
+        view._prepare(playback_preview=True)
+    else:
+        view._choose_test_tone()
     wait_until(app, lambda: view.worker is None)
     stimulus = view.stimulus
     view.playback_start.click()
@@ -450,6 +468,7 @@ def test_playback_volume_is_applied_to_the_first_calibration_output(window, app)
     choice = view._playback_start_choice
     assert choice["volume_fraction"] == 0.15
     assert choice["peak_v"] == pytest.approx(0.075)
+    initial_peak = 0.01875 if windowed else 0.075
     view.language.setCurrentIndex(1)
     assert view.adopt_start_button.text() == "Use this volume to start calibration"
     view.adopt_start_button.click()
@@ -458,17 +477,18 @@ def test_playback_volume_is_applied_to_the_first_calibration_output(window, app)
     assert view.stimulus is stimulus
     assert view.reference is reference
     assert view.editor.setup().measurement.start_scale_v == pytest.approx(choice["scale_v"])
-    assert "0.075 Vpeak" in view.start_level_info.text()
+    assert f"{initial_peak:g} Vpeak" in view.start_level_info.text()
     assert read_json(Path(choice["playback_record"]) / "summary.json")["status"] == "stopped"
     events = [read_json(path) for path in view.activity.directory.glob("events/*.json")]
     selected = next(event for event in events if event["action"] == "start_level_selected")
     assert selected["scale_v"] == choice["scale_v"]
+    assert selected["initial_peak_v"] == pytest.approx(initial_peak)
     view.target.setValue(70)
     view.calibrate_button.click()
     wait_until(app, lambda: view.worker is None)
     result = read_json(view.last_output / "result.json")
     assert result["iterations"][0]["scale_v"] == pytest.approx(choice["scale_v"])
-    assert result["iterations"][0]["output_peak_v"] == pytest.approx(0.075)
+    assert result["iterations"][0]["output_peak_v"] == pytest.approx(initial_peak)
     assert result["setup"]["measurement"]["start_scale_v"] == choice["scale_v"]
     view.source_location.setText("a-different-waveform.wav")
     assert not view.adopt_start_button.isEnabled()

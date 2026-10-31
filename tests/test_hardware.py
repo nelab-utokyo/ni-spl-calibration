@@ -27,6 +27,7 @@ def fake_driver(monkeypatch, *, fail_read=False, coerce_rate=False):
             self.ao_channels = NS(add_ao_voltage_chan=self.add_ao)
             self.in_stream = self
             self.out_stream = self
+            self.output_buf_size = 0
 
         def add_ai(self, *args, **kwargs):
             self.kind = "ai"
@@ -46,6 +47,8 @@ def fake_driver(monkeypatch, *, fail_read=False, coerce_rate=False):
             events.append(("reset", value))
 
         def control(self, mode):
+            if self.kind == "ao" and self.output_buf_size == 0:
+                raise RuntimeError("-201025: Non-buffered hardware-timed AO is unsupported")
             events.append(("commit", self.kind))
             events.append(
                 (

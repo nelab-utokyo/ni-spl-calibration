@@ -83,6 +83,42 @@ def test_search_interrupt_preserves_iterations_and_resets_output(setup):
     assert hardware.resets == 2
 
 
+def test_phases_report_only_the_selected_playback_interval(setup):
+    setup = replace(setup, measurement=replace(setup.measurement, stop_s=0.05))
+    phases = []
+
+    class CheckingHardware(SimulatedHardware):
+        playback_started = False
+
+        def acquire(self, count):
+            if not self.playback_started:
+                assert phases[-1]["phase"] == "background"
+                assert phases[-1]["duration_s"] == count / self.settings.sample_rate_hz
+            return super().acquire(count)
+
+        def play_and_record(self, output):
+            self.playback_started = True
+            assert phases[-1]["phase"] == "playback"
+            assert phases[-1]["duration_s"] == len(output) / self.settings.sample_rate_hz
+            return super().play_and_record(output)
+
+    result = calibrate(
+        Stimulus(tone(), 20000),
+        setup=setup,
+        reference=reference(setup),
+        target_spl_db=70,
+        hardware=CheckingHardware(setup.daq),
+        on_phase=phases.append,
+    )
+    assert phases[0]["duration_s"] == 0.05
+    assert phases[1]["duration_s"] == pytest.approx(0.05005)
+    assert (phases[1]["start_s"], phases[1]["stop_s"]) == (0, 0.05)
+    assert len(phases) == len(result.iterations) + 1
+    assert [item["iteration"] for item in phases[1:]] == [
+        item["iteration"] for item in result.iterations
+    ]
+
+
 def test_reference_rejects_noise_wrong_frequency_clipping_and_drift(setup):
     with pytest.raises(RuntimeError):
         measure_reference(setup, hardware=SimulatedHardware(setup.daq))
@@ -210,6 +246,71 @@ def test_window_and_acoustic_delay_measure_only_selected_samples(setup):
     assert result.scale_v == pytest.approx(
         (20e-6 * 10**3.5) / np.sqrt(np.mean(tone() ** 2)), rel=1e-8
     )
+
+
+@pytest.mark.parametrize("start,stop", [(0, 0.05), (0.05, 0.15), (0.1, None)])
+@pytest.mark.parametrize("delay_s", [0, 0.005])
+def test_only_selected_samples_are_played_and_reused(setup, start, stop, delay_s):
+    setup = replace(
+        setup,
+        measurement=MeasurementSettings(
+            start_s=start, stop_s=stop, acoustic_delay_s=delay_s, start_scale_v=3
+        ),
+    )
+    fs = setup.daq.sample_rate_hz
+    samples = tone()
+    first, last = round(start * fs), len(samples) if stop is None else round(stop * fs)
+    samples[first:last] *= 0.25  # Larger unplayed samples must not limit the selected output.
+    stimulus = Stimulus(samples, fs)
+    selected = samples[first:last]
+    delay = round(delay_s * fs)
+
+    class RecordingHardware(SimulatedHardware):
+        def __init__(self):
+            super().__init__(setup.daq, noise_rms_v=0)
+            self.outputs = []
+            self.acquired_counts = []
+
+        def acquire(self, count):
+            self.acquired_counts.append(count)
+            return super().acquire(count)
+
+        def play_and_record(self, output):
+            self.outputs.append(output.copy())
+            captured = super().play_and_record(output)
+            return np.concatenate((np.zeros(delay), captured[: len(captured) - delay]))
+
+    hardware = RecordingHardware()
+    ref = measure_reference(
+        setup, hardware=SimulatedHardware(setup.daq, reference_mode=True, noise_rms_v=0)
+    )
+    result = calibrate(stimulus, setup=setup, reference=ref, target_spl_db=70, hardware=hardware)
+    assert hardware.acquired_counts[0] == len(selected)
+    assert result.iterations[0]["output_peak_v"] == pytest.approx(setup.daq.max_peak_v)
+    for output, iteration in zip(hardware.outputs, result.iterations, strict=True):
+        assert len(output) == len(selected) + delay + 1
+        np.testing.assert_array_equal(output[: len(selected)], selected * iteration["scale_v"])
+        np.testing.assert_array_equal(output[len(selected) :], np.zeros(delay + 1))
+    expected = selected * result.scale_v
+    assert result.measured_spl_db == pytest.approx(70, abs=1e-6)
+    assert result.output_peak_v == pytest.approx(np.max(np.abs(expected)))
+    assert result.output_rms_v == pytest.approx(np.sqrt(np.mean(expected**2)))
+    np.testing.assert_array_equal(apply_calibration(stimulus, result), expected)
+    np.testing.assert_array_equal(stimulus.samples, samples)
+
+
+@pytest.mark.parametrize("constant", [0, 0.25])
+def test_silent_selected_interval_is_rejected_before_hardware_access(setup, monkeypatch, constant):
+    from ni_spl_calibration import calibration
+
+    setup = replace(setup, measurement=MeasurementSettings(stop_s=0.1))
+    stimulus = Stimulus(np.concatenate((np.full(2000, constant), tone(duration=0.1))), 20000)
+    ref = reference(setup)
+    monkeypatch.setattr(
+        calibration, "NIDaqHardware", lambda *_: pytest.fail("Silent interval must not access DAQ")
+    )
+    with pytest.raises(ValueError, match="silent or constant"):
+        calibrate(stimulus, setup=setup, reference=ref, target_spl_db=70)
 
 
 def test_stale_reference_backend_and_rate_fail_before_capture(setup):

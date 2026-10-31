@@ -124,6 +124,7 @@ def calibrate_to_directory(
     output,
     hardware,
     on_iteration=None,
+    on_phase=None,
     cancel_requested=None,
     parent_run=None,
     on_samples=None,
@@ -137,6 +138,8 @@ def calibrate_to_directory(
     if cancel_requested is not None and cancel_requested():
         raise MeasurementCancelled("Measurement cancelled")
     output.mkdir(parents=True, exist_ok=False)
+    if on_phase is not None:
+        on_phase({"kind": "calibration_phase", "phase": "saving"})
     save_stimulus(stimulus, output / "stimulus.npz")
     write_json(output / "setup.json", asdict(setup))
     write_json(output / "reference.json", reference)
@@ -155,6 +158,7 @@ def calibrate_to_directory(
             target_spl_db=target_spl_db,
             hardware=hardware,
             on_iteration=on_iteration,
+            on_phase=on_phase,
             cancel_requested=cancel_requested,
             on_samples=on_samples,
         )
