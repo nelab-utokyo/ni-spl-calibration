@@ -1,9 +1,10 @@
-"""Materialize every source once; never normalize or resample implicitly."""
+"""Materialize sources once; convert WAV only to an explicitly supplied target rate."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -11,6 +12,14 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+from scipy.signal import resample_poly
+
+
+def _validate_sample_rate(sample_rate_hz: int) -> None:
+    if isinstance(sample_rate_hz, bool) or not isinstance(sample_rate_hz, int):
+        raise ValueError("sample_rate_hz must be an integer")
+    if sample_rate_hz < 2:
+        raise ValueError("sample_rate_hz must be >= 2")
 
 
 @dataclass(frozen=True)
@@ -20,10 +29,7 @@ class Stimulus:
     provenance: dict = field(default_factory=lambda: {"kind": "array"})
 
     def __post_init__(self):
-        if isinstance(self.sample_rate_hz, bool) or not isinstance(self.sample_rate_hz, int):
-            raise ValueError("sample_rate_hz must be an integer")
-        if self.sample_rate_hz < 2:
-            raise ValueError("sample_rate_hz must be >= 2")
+        _validate_sample_rate(self.sample_rate_hz)
         samples = np.array(self.samples, dtype="<f8", copy=True)
         if samples.ndim != 1 or samples.size < 16:
             raise ValueError("Provide at least 16 mono samples")
@@ -58,7 +64,15 @@ class Stimulus:
         }
 
 
-def load_wav(path: str | Path) -> Stimulus:
+def load_wav(path: str | Path, *, sample_rate_hz: int | None = None) -> Stimulus:
+    """Read mono WAV; optionally resample to a target rate without normalization.
+
+    Omit sample_rate_hz to retain the original samples and rate. A matching target
+    also preserves the samples exactly. Conversion uses an anti-aliasing FIR filter
+    and records the original rate/count; the returned samples are what to calibrate.
+    """
+    if sample_rate_hz is not None:
+        _validate_sample_rate(sample_rate_hz)
     path = Path(path)
     contents = path.read_bytes()
     with sf.SoundFile(BytesIO(contents)) as audio:
@@ -68,7 +82,7 @@ def load_wav(path: str | Path) -> Stimulus:
             raise ValueError("Only mono WAV is supported; select/mix channels explicitly")
         samples = audio.read(dtype="float64")
         rate = audio.samplerate
-    return Stimulus(
+    stimulus = Stimulus(
         samples,
         rate,
         {
@@ -77,10 +91,41 @@ def load_wav(path: str | Path) -> Stimulus:
             "file_sha256": hashlib.sha256(contents).hexdigest(),
         },
     )
+    if sample_rate_hz is None or sample_rate_hz == rate:
+        return stimulus
+    divisor = math.gcd(rate, sample_rate_hz)
+    samples = resample_poly(
+        stimulus.samples,
+        sample_rate_hz // divisor,
+        rate // divisor,
+        window=("kaiser", 5.0),
+        padtype="constant",
+    )
+    if np.max(np.abs(samples)) > 1:
+        raise ValueError(
+            "Resampled WAV exceeds [-1, 1]; reduce the source amplitude explicitly "
+            "before calibration"
+        )
+    return Stimulus(
+        samples,
+        sample_rate_hz,
+        {
+            **stimulus.provenance,
+            "resampling": {
+                "method": "scipy.signal.resample_poly",
+                "source_sample_rate_hz": rate,
+                "source_sample_count": len(stimulus.samples),
+                "target_sample_rate_hz": sample_rate_hz,
+                "window": ["kaiser", 5.0],
+                "padtype": "constant",
+            },
+        },
+    )
 
 
 def from_generator(generator: Callable, *, sample_rate_hz: int, **parameters) -> Stimulus:
     """Call generator(sample_rate_hz=..., **parameters) exactly once."""
+    _validate_sample_rate(sample_rate_hz)
     if not callable(generator):
         raise TypeError("generator must be callable")
     module = getattr(generator, "__module__", type(generator).__module__)

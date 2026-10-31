@@ -26,6 +26,34 @@ Physical hardware also requires the **NI-DAQmx driver** appropriate for your DAQ
 
 For pip, run `python -m pip install ".[daq]"` from the repository root. The repository includes `uv.lock` so uv can reproduce the dependency versions.
 
+## Commands and workflow
+
+The usual flow is **configure → measure the microphone reference → calibrate each waveform → play the saved waveform in your experiment**.
+
+| Command | Purpose | When to run |
+|---|---|---|
+| `init my-setup.yaml` | Create a configuration template to edit | Once, or copy an existing setup |
+| `inspect --setup my-setup.yaml --wav stimulus.wav` | Preview the playback waveform's rate, length, amplitude and conversion history without DAQ access | Optional, before measurement |
+| `reference my-setup.yaml --output …` | Measure microphone input sensitivity with an acoustic calibrator | Initially and after changes such as DAQ rate or input-chain settings |
+| `calibrate my-setup.yaml --reference … --wav … --target-spl-db … --output …` | Play the waveform and find the voltage scale for the target SPL | For each waveform, target level and acoustic path |
+
+With an existing setup and valid reference, routine use requires **only `calibrate`**. Between `reference` and `calibrate`, remove the calibrator and place the microphone at the measurement position. You do not need to repeat both measurements every time.
+
+For experimental playback, apply the scale to the saved waveform using the Python API ([Use the calibration result for playback](#use-the-calibration-result-for-playback)). There is no separate `play` command.
+
+## Set the sample rate in one place
+
+```yaml
+daq:
+  sample_rate_hz: 200000
+```
+
+This value controls DAQ AI/AO, the WAV playback rate and the `sample_rate_hz` passed to generators. The source WAV rate is read from its header. When it differs, the WAV is resampled with an anti-aliasing filter before calibration, and the converted samples are calibrated and saved. Matching rates preserve the samples exactly. Do not put `sample_rate_hz` in the generator parameter YAML.
+
+Use `inspect --setup my-setup.yaml …` to preview the same prepared waveform. Without a setup, `inspect --wav …` inspects the original WAV. Standalone inspection also accepts `inspect --sample-rate-hz …`; use `--setup` for the normal workflow. Standalone generator inspection defaults to 200000 Hz.
+
+After changing the rate, measure a new reference and recalibrate the stimulus. Saved `stimulus.npz` files preserve a calibrated waveform exactly: they are never resampled, and a mismatch with the setup rate is rejected.
+
 ## Try the complete workflow without hardware
 
 Run the following from the repository root. The `results/` directory is excluded from Git.
@@ -70,7 +98,7 @@ AO remains at 0 V while the package checks the reference frequency, pure-tone co
 Remove the calibrator and place the microphone at the intended measurement position.
 
 ```sh
-uv run ni-spl inspect --wav stimulus.wav
+uv run ni-spl inspect --setup my-setup.yaml --wav stimulus.wav
 uv run ni-spl calibrate my-setup.yaml --reference results/reference-001.json --wav stimulus.wav --target-spl-db 70 --output results/stimulus-001
 ```
 
@@ -80,7 +108,7 @@ To use a sound generator function, provide a callable that accepts `sample_rate_
 uv run ni-spl calibrate my-setup.yaml --reference results/reference-001.json --generator examples/custom_sound.py:make_sound --parameters examples/parameters.yaml --target-spl-db 70 --output results/generated-001
 ```
 
-The generator is called once, and that waveform remains fixed throughout the search. PCM and floating-point WAV files are supported. Amplitude normalization, channel mixing, and sample-rate conversion are never performed implicitly. If the WAV and DAQ rates differ, explicitly convert the waveform and calibrate the converted version. Include any onset/offset ramps in the source waveform.
+The generator is called once, and that waveform remains fixed throughout the search. PCM and floating-point WAV files are supported and converted to `daq.sample_rate_hz` when necessary. Downsampling filters out components above the new Nyquist frequency, so choose a rate that includes the required bandwidth. Amplitude normalization and channel mixing are never performed automatically. Conversion that exceeds `[-1, 1]` is rejected; leave amplitude headroom in the source WAV. Include any onset/offset ramps in the source waveform.
 
 ## Define what the target SPL means
 
@@ -108,7 +136,7 @@ The output directory contains:
 | File | Contents |
 |---|---|
 | `result.json` | Voltage scale, measured SPL, output RMS/peak voltage, complete search history, setup, reference, and hardware/library information |
-| `stimulus.npz` | Losslessly saved waveform, sample rate, and source information used in the search |
+| `stimulus.npz` | Losslessly saved waveform used in the search (after WAV conversion, if any), sample rate, source and conversion information |
 | `setup.json` / `reference.json` | Snapshots of the configuration and reference measurement |
 | `failure.json` | Failure reason and available search history; no success record is created on failure |
 
@@ -118,13 +146,14 @@ from ni_spl_calibration import load_result, load_stimulus, apply_calibration
 stimulus = load_stimulus("results/stimulus-001/stimulus.npz")
 result = load_result("results/stimulus-001/result.json")
 output_v = apply_calibration(stimulus, result)
+# Read the playback rate from stimulus.sample_rate_hz.
 # Play output_v using the calibrated DAQ rate, AO channel, and signal chain.
 # output_v is in volts. Do not apply another gain or normalization.
 ```
 
 `scale_v` is volts per digital unit; the playback voltage is `samples * scale_v`. `apply_calibration` checks the waveform/sample-rate hash and voltage limit. The returned array has the same length as the source waveform, so your own playback implementation must also return AO to 0 V at the end.
 
-From Python, pass a `Stimulus(samples, sample_rate_hz)`, the result of `load_wav(...)`, or the result of `from_generator(...)` to `calibrate(...)`. DAQ operations are separated into `NIDaqHardware`; tests can use `SimulatedHardware`. See [examples/python_api.py](examples/python_api.py) for a complete example.
+From Python, pass `Stimulus(samples, setup.daq.sample_rate_hz)`, `load_wav(path, sample_rate_hz=setup.daq.sample_rate_hz)`, or `from_generator(fn, sample_rate_hz=setup.daq.sample_rate_hz, ...)` to `calibrate(...)`. Omitting the rate in `load_wav(path)` preserves the original WAV. After calibration, use the saved `stimulus.npz` for playback. DAQ operations are separated into `NIDaqHardware`; tests can use `SimulatedHardware`. See [examples/python_api.py](examples/python_api.py) for a complete example.
 
 ## Scope and validation status
 

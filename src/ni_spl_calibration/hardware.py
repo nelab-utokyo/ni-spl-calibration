@@ -39,7 +39,7 @@ def output_guard(hardware: Hardware):
 
 def runtime_versions() -> dict:
     versions = {"python": platform.python_version(), "platform": platform.system()}
-    for package in ("ni-spl-calibration", "numpy", "soundfile", "nidaqmx"):
+    for package in ("ni-spl-calibration", "numpy", "scipy", "soundfile", "nidaqmx"):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:

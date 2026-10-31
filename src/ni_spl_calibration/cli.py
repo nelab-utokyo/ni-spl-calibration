@@ -17,7 +17,7 @@ from .calibration import (
     measurement_bounds,
     validate_reference,
 )
-from .config import Setup, load_setup
+from .config import DEFAULT_SAMPLE_RATE_HZ, Setup, load_setup
 from .hardware import NIDaqHardware, SimulatedHardware
 from .stimulus import from_generator, load_stimulus, load_wav, save_stimulus
 from .storage import write_json
@@ -30,11 +30,16 @@ def parser():
     init.add_argument("output", type=Path)
     inspect = commands.add_parser("inspect", help="Inspect a waveform without accessing hardware")
     _source_arguments(inspect)
-    inspect.add_argument(
+    rate = inspect.add_mutually_exclusive_group()
+    rate.add_argument(
+        "--setup",
+        type=Path,
+        help="Use the same DAQ/WAV/generator sample rate as calibration",
+    )
+    rate.add_argument(
         "--sample-rate-hz",
         type=int,
-        default=200_000,
-        help="Generator sample rate (WAV/NPZ keep their own rate)",
+        help=f"Standalone WAV/generator target rate (generator default: {DEFAULT_SAMPLE_RATE_HZ})",
     )
     reference = commands.add_parser("reference", help="Measure the acoustic-calibrator reference")
     reference.add_argument("setup", type=Path)
@@ -69,18 +74,29 @@ def _hardware_arguments(command):
     )
 
 
-def _stimulus(args, sample_rate_hz):
+def _stimulus(args, sample_rate_hz=None):
     if args.parameters and not args.generator:
         raise ValueError("--parameters requires --generator")
     if args.wav:
-        return load_wav(args.wav)
+        return load_wav(args.wav, sample_rate_hz=sample_rate_hz)
     if args.npz:
-        return load_stimulus(args.npz)
+        stimulus = load_stimulus(args.npz)
+        if sample_rate_hz is not None and stimulus.sample_rate_hz != sample_rate_hz:
+            raise ValueError(
+                "Saved stimulus and DAQ/target sample rates differ; NPZ is never resampled. "
+                "Use the original WAV/generator to recalibrate at the new setup rate."
+            )
+        return stimulus
     parameters = {}
     if args.parameters:
         parameters = yaml.safe_load(args.parameters.read_text(encoding="utf-8"))
         if not isinstance(parameters, dict):
             raise ValueError("Generator parameters must be a YAML mapping")
+        if "sample_rate_hz" in parameters:
+            raise ValueError(
+                "Set sample_rate_hz in setup.daq, not in generator parameters "
+                "(standalone inspect also accepts --sample-rate-hz)"
+            )
     module_name, separator, function_name = args.generator.rpartition(":")
     if not separator or not module_name or not function_name:
         raise ValueError("Use --generator module:function or file.py:function")
@@ -97,7 +113,11 @@ def _stimulus(args, sample_rate_hz):
     function = getattr(module, function_name)
     if not callable(function):
         raise ValueError("Generator must be callable")
-    return from_generator(function, sample_rate_hz=sample_rate_hz, **parameters)
+    return from_generator(
+        function,
+        sample_rate_hz=DEFAULT_SAMPLE_RATE_HZ if sample_rate_hz is None else sample_rate_hz,
+        **parameters,
+    )
 
 
 def _hardware(args, setup, reference_mode=False):
@@ -111,14 +131,18 @@ def _hardware(args, setup, reference_mode=False):
     return NIDaqHardware(setup.daq)
 
 
-def _confirm(args, setup):
+def _confirm(args, setup, stimulus=None):
     if args.simulate:
         print("SIMULATION: results do not represent a physical acoustic calibration.")
     print(f"Setup: {setup.setup_id}; {setup.chain_notes}")
     print(
         f"AI: {setup.daq.input_channel} ({setup.daq.terminal_configuration}); "
-        f"AO: {setup.daq.output_channel}; limit: {setup.daq.max_peak_v:g} Vpeak"
+        f"AO: {setup.daq.output_channel}; sample rate: {setup.daq.sample_rate_hz} Hz; "
+        f"limit: {setup.daq.max_peak_v:g} Vpeak"
     )
+    if stimulus is not None and "resampling" in stimulus.provenance:
+        source_rate = stimulus.provenance["resampling"]["source_sample_rate_hz"]
+        print(f"WAV resampled: {source_rate} -> {stimulus.sample_rate_hz} Hz before calibration.")
     if args.command == "reference":
         print(
             f"Fit the calibrator: {setup.reference_level_db:g} dB SPL, "
@@ -153,9 +177,10 @@ def _run(args):
         )
         return
     if args.command == "inspect":
-        print(
-            json.dumps(_stimulus(args, args.sample_rate_hz).describe(), indent=2, allow_nan=False)
+        sample_rate_hz = (
+            load_setup(args.setup).daq.sample_rate_hz if args.setup else args.sample_rate_hz
         )
+        print(json.dumps(_stimulus(args, sample_rate_hz).describe(), indent=2, allow_nan=False))
         return
     setup = load_setup(args.setup)
     if args.output.exists() or args.output.is_symlink():
@@ -170,7 +195,7 @@ def _run(args):
     validate_reference(setup, reference)
     stimulus = _stimulus(args, setup.daq.sample_rate_hz)
     measurement_bounds(stimulus, setup)
-    _confirm(args, setup)
+    _confirm(args, setup, stimulus)
     hardware = _hardware(args, setup)
     validate_reference(setup, reference, hardware)
     args.output.mkdir(parents=True, exist_ok=False)

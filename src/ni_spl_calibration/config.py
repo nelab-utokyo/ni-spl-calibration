@@ -8,12 +8,14 @@ from pathlib import Path
 
 import yaml
 
+DEFAULT_SAMPLE_RATE_HZ = 200_000
+
 
 @dataclass(frozen=True)
 class DaqSettings:
     input_channel: str = "Dev1/ai0"
     output_channel: str = "Dev1/ao0"
-    sample_rate_hz: int = 200_000
+    sample_rate_hz: int = DEFAULT_SAMPLE_RATE_HZ
     terminal_configuration: str = "differential"
     input_min_v: float = -10.0
     input_max_v: float = 10.0

@@ -26,6 +26,34 @@ uv run ni-spl --help
 
 pipの場合はリポジトリ直下で `python -m pip install ".[daq]"` を実行してインストールできます。リポジトリには `uv.lock` を含み、uvでは同じ依存バージョンを再現できます。
 
+## コマンドと全体の流れ
+
+通常の流れは **設定 → マイク基準測定 → 波形ごとの校正 → 保存した波形を実験で再生** です。
+
+| コマンド | 役割 | 実行するタイミング |
+|---|---|---|
+| `init my-setup.yaml` | 編集用の設定ファイルを作る | 最初の1回。既存の設定をコピーしてもよい |
+| `inspect --setup my-setup.yaml --wav stimulus.wav` | 再生用波形のレート・長さ・振幅・変換履歴を確認する。DAQは操作しない | 任意。測定前の確認用 |
+| `reference my-setup.yaml --output …` | 音響校正器でマイク入力系の感度を測る | 初回、およびDAQレート・入力系設定などを変更したとき |
+| `calibrate my-setup.yaml --reference … --wav … --target-spl-db … --output …` | 実際の波形を再生して目標音圧になる電圧倍率を求める | 波形・目標音圧・音響経路ごと |
+
+作成済みの設定と有効な基準記録があれば、普段は **`calibrate` だけ**で済みます。`reference` と `calibrate` の間には、校正器を外してマイクを測定位置に置く作業が入ります。両方の測定を毎回やり直す必要はありません。
+
+校正後の実験用再生はPython APIで保存波形に倍率を適用します（[校正結果を再生に使う](#校正結果を再生に使う)）。独立した `play` コマンドはありません。
+
+## サンプルレートは設定ファイルの1か所で指定する
+
+```yaml
+daq:
+  sample_rate_hz: 200000
+```
+
+この値をDAQのAI/AO、WAVの再生用レート、生成関数への `sample_rate_hz` に共通で使います。WAVの元レートはヘッダから読み取るため手入力不要です。異なる場合は校正前にフィルタ付きでリサンプリングし、変換後の波形を校正・保存します。同じレートならサンプルは変更しません。生成関数のパラメータYAMLには `sample_rate_hz` を書きません。
+
+`inspect --setup my-setup.yaml …` も同じレートで準備した波形を表示します。設定なしの `inspect --wav …` は元WAVの確認用です。単独確認には `inspect --sample-rate-hz …` も使えますが、通常は `--setup` で統一してください。設定なしの生成関数の確認は既定の200000 Hzを使います。
+
+レート変更後は基準測定と刺激の校正をやり直します。保存済み `stimulus.npz` は校正済み波形の再現用なので変換せず、設定とレートが異なれば停止します。
+
 ## 実機なしで一通り確認する
 
 以下はリポジトリ直下で実行します。`results/` はGit対象外です。
@@ -70,7 +98,7 @@ AOを0 Vに保ち、基準信号の周波数・純音成分・時間的安定性
 校正器を外し、マイクを実際の測定位置に置きます。
 
 ```sh
-uv run ni-spl inspect --wav stimulus.wav
+uv run ni-spl inspect --setup my-setup.yaml --wav stimulus.wav
 uv run ni-spl calibrate my-setup.yaml --reference results/reference-001.json --wav stimulus.wav --target-spl-db 70 --output results/stimulus-001
 ```
 
@@ -80,7 +108,7 @@ uv run ni-spl calibrate my-setup.yaml --reference results/reference-001.json --w
 uv run ni-spl calibrate my-setup.yaml --reference results/reference-001.json --generator examples/custom_sound.py:make_sound --parameters examples/parameters.yaml --target-spl-db 70 --output results/generated-001
 ```
 
-生成関数は1回だけ呼び、探索中はその波形を固定します。WAVはPCM/浮動小数点形式を読み、振幅の自動正規化・チャンネル混合・サンプルレート変換は行いません。WAVとDAQのレートが異なる場合は、明示的に変換した波形で校正してください。立ち上がり/立ち下がりランプも元波形に含めます。
+生成関数は1回だけ呼び、探索中はその波形を固定します。WAVはPCM/浮動小数点形式を読み、必要なら `daq.sample_rate_hz` へ変換します。低いレートへの変換では新しいNyquist周波数より高い成分がフィルタで抑えられるため、必要な帯域を含むレートを選んでください。振幅の自動正規化・チャンネル混合は行いません。変換で振幅が `[-1, 1]` を超える場合は停止するので、元WAVに余裕を持たせてください。立ち上がり/立ち下がりランプも元波形に含めます。
 
 ## 「目標音圧」の意味を設定する
 
@@ -108,7 +136,7 @@ measurement:
 | ファイル | 内容 |
 |---|---|
 | `result.json` | 倍率、実測音圧、出力RMS/ピーク、全探索結果、設定、基準、機器/ライブラリ情報 |
-| `stimulus.npz` | 探索に使用した波形・サンプルレート・入力元情報を可逆保存 |
+| `stimulus.npz` | 探索に使用した波形（WAV変換時は変換後）・サンプルレート・入力元/変換情報を可逆保存 |
 | `setup.json` / `reference.json` | 設定と基準測定のスナップショット |
 | `failure.json` | 失敗時の理由・取得済み探索履歴。成功記録は作成しない |
 
@@ -119,12 +147,13 @@ stimulus = load_stimulus("results/stimulus-001/stimulus.npz")
 result = load_result("results/stimulus-001/result.json")
 output_v = apply_calibration(stimulus, result)
 # 使用したDAQレート・AOチャンネル・信号経路でoutput_vを再生する。
+# 再生レートはstimulus.sample_rate_hzから取得する。
 # output_vの単位はV。追加のgainや正規化を掛けない。
 ```
 
 `scale_v` はデジタル値1あたりのVで、再生電圧は `samples * scale_v` です。`apply_calibration` は波形/レートのハッシュと電圧上限を確認します。返す配列は元波形と同じ長さなので、独自の再生処理でも終了時の0 V出力を実装してください。
 
-Pythonからは `Stimulus(samples, sample_rate_hz)`、`load_wav(...)`、`from_generator(...)` を `calibrate(...)` に渡せます。DAQ操作は `NIDaqHardware` に分離し、テストでは `SimulatedHardware` を使えます。全体の例は [examples/python_api.py](examples/python_api.py) にあります。
+Pythonからは `Stimulus(samples, setup.daq.sample_rate_hz)`、`load_wav(path, sample_rate_hz=setup.daq.sample_rate_hz)`、`from_generator(fn, sample_rate_hz=setup.daq.sample_rate_hz, ...)` を `calibrate(...)` に渡せます。`load_wav(path)` のようにレートを省略した場合は元WAVをそのまま読み込みます。校正後は、保存した `stimulus.npz` を再生に使ってください。DAQ操作は `NIDaqHardware` に分離し、テストでは `SimulatedHardware` を使えます。全体の例は [examples/python_api.py](examples/python_api.py) にあります。
 
 ## 適用範囲と確認状況
 

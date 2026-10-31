@@ -6,6 +6,8 @@ chain_notes: >-
 daq:
   input_channel: Dev1/ai0
   output_channel: Dev1/ao0
+  # Common rate for DAQ AI/AO, WAV playback and generators.
+  # WAV source rates are read from their headers and converted to this rate.
   sample_rate_hz: 200000
   terminal_configuration: differential
   input_min_v: -10.0
