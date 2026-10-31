@@ -377,7 +377,7 @@ def test_test_playback_fader_stereo_monitor_mute_and_mid_file_stop(window, app, 
         lambda: (
             view.worker is not None
             and view.job_kind == "test_playback"
-            and view.playback_spectrum.spectrum is not None
+            and view.monitor_spectrum.spectrum is not None
         ),
     )
     assert view.volume_fader.isEnabled()
@@ -388,7 +388,7 @@ def test_test_playback_fader_stereo_monitor_mute_and_mid_file_stop(window, app, 
     assert view.stimulus.sample_rate_hz == 32000
     assert "元WAV 2 ch" in view.playback_channel_info.text()
     assert "変換前 RMS" in view.playback_file_info.text()
-    assert view.playback_rms.text() != "—"
+    assert view.monitor_rms.text() != "—"
     directory = view.job_output
     view.volume_fader.setValue(800)
     wait_until(app, lambda: "80.0%" in view.playback_status.text())
@@ -424,4 +424,4 @@ def test_built_in_tone_selection_and_one_shot_test_playback(window, app):
     wait_until(app, lambda: view.worker is None, timeout=8)
     assert read_json(view.job_output / "summary.json")["status"] == "complete"
     assert view.playback_peak.text() == "0"
-    assert view.playback_spectrum.spectrum is not None
+    assert view.monitor_spectrum.spectrum is not None

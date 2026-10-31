@@ -46,7 +46,7 @@ Use **Language** at the top to switch between Japanese and English. Settings, se
 | **2 マイク基準測定 (Microphone reference)** | Fit the calibrator, measure and save a reference, or load a compatible existing JSON |
 | **3 波形校正 (Waveform calibration)** | Remove the calibrator and position the microphone. Select WAV/NPZ/generator, preview the waveform and resampling, set the target and start calibration |
 | **4 履歴・再現 (History and restore)** | Restore conditions from successful, failed or cancelled runs, including runs saved elsewhere |
-| **5 マイクモニター (Microphone monitor)** | View logarithmic frequency bars, RMS/peak voltage and total SPL. Optionally save raw captures |
+| **5 マイクモニター (Microphone monitor)** | Configure raw input recording and inspect capture status and recording folders |
 | **6 テスト再生 (Test playback)** | Play WAV/generated audio through AO with a live volume fader and simultaneous microphone monitoring; no reference required |
 
 Set the sample rate once in the setup tab. Measurement runs in a worker thread while the GUI displays iterations and levels. Stop and closing the window are supported during playback. NI reads are split into approximately 20 ms chunks: cancellation stops AO, then AI, closes the tasks and commands 0 V. The full waveform need not finish. USB, OS and driver latency still apply; this is not a hardware cutoff with a guaranteed response time. Every run receives a new output path. Changes to rate, hardware/input settings or backend require a compatible reference.
@@ -61,7 +61,9 @@ GUI operation starts, completion, failures, stop requests and setup/reference fi
 
 ### Live microphone monitoring
 
-In the monitor tab, click Start monitor. The spectrum updates approximately every 100 ms. Frequency is logarithmic, up to Nyquist; bars show approximately third-octave RMS voltage levels in dBV (relative to 1 V). This is a display, not an equalization filter. With a valid reference, **total SPL including background** is also shown in the configured measurement band; it differs from calibration's background-subtracted signal level. Clipping is flagged and the frame's SPL is not reported. Reference and calibration captures also feed this live display.
+The spectrum, RMS/peak voltage and total SPL are **always visible in the shared panel below the tabs**, regardless of tab selection or scrolling. Click Start monitor in that panel from any tab. Configure raw input recording and open recording folders in the Microphone monitor tab.
+
+During capture, the spectrum updates approximately every 100 ms. Frequency is logarithmic, up to Nyquist; bars show approximately third-octave RMS voltage levels in dBV (relative to 1 V). The panel shows an idle state before acquisition and labels the last input after stopping. This is a display, not an equalization filter. With a valid reference, **total SPL including background** is also shown in the configured measurement band; it differs from calibration's background-subtracted signal level. Clipping is flagged and the frame's SPL is not reported. Reference, calibration and test playback captures also feed this shared display.
 
 AO stays at 0 V. Monitoring and reference/calibration tasks are mutually exclusive. Use Stop before continuing measurements.
 

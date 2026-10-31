@@ -559,6 +559,7 @@ class CalibrationWindow(QMainWindow):
         self._history_tab()
         self._monitor_tab()
         self._playback_tab()
+        layout.addWidget(self._microphone_panel())
         self.progress = QProgressBar()
         self.progress.setTextVisible(False)
         self.progress.setRange(0, 1)
@@ -593,7 +594,6 @@ class CalibrationWindow(QMainWindow):
         retranslate(self)
         self.waveform.update()
         self.monitor_spectrum.update()
-        self.playback_spectrum.update()
 
     def _page(self, title, *, scroll=False):
         page = QWidget()
@@ -630,7 +630,7 @@ class CalibrationWindow(QMainWindow):
         )
 
     def _reference_tab(self):
-        layout = self._page("2  マイク基準測定")
+        layout = self._page("2  マイク基準測定", scroll=True)
         layout.addWidget(label("校正器をマイクに装着して、入力系の感度を測定します。"))
         layout.addWidget(
             label("有効な基準記録を読み込めば、同じ設定で再利用できます。", muted=True)
@@ -748,7 +748,7 @@ class CalibrationWindow(QMainWindow):
         )
 
     def _history_tab(self):
-        layout = self._page("4  履歴・再現")
+        layout = self._page("4  履歴・再現", scroll=True)
         layout.addWidget(
             label("過去の実行から、設定・波形・基準・目標音圧をまとめて復元できます。")
         )
@@ -856,25 +856,21 @@ class CalibrationWindow(QMainWindow):
                 muted=True,
             )
         )
-        self.monitor_start = button("モニターを開始", self._start_monitor, primary=True)
         self.save_monitor = QCheckBox("生のマイク入力も保存する (NPZ)")
         set_text(self.save_monitor, "生のマイク入力も保存する (NPZ)")
         self.save_monitor.setChecked(True)
-        layout.addWidget(row(self.monitor_start, self.save_monitor))
+        layout.addWidget(self.save_monitor)
         self.monitor_status = label("停止中。基準がなくても電圧波形を確認できます。", muted=True)
         layout.addWidget(self.monitor_status)
-        rms_card, self.monitor_rms = metric("入力RMS [V]")
-        peak_card, self.monitor_peak = metric("入力ピーク [V]")
-        level_card, self.monitor_level = metric("総音圧 [dB SPL]")
-        layout.addWidget(row(rms_card, peak_card, level_card))
+        layout.addWidget(
+            label("入力スペクトラム・電圧・音圧は、どのタブでも画面下部に表示します。")
+        )
         layout.addWidget(
             label(
                 "横軸は周波数（対数）、縦軸は帯域RMSのdBVです。音声を加工する機能ではありません。",
                 muted=True,
             )
         )
-        self.monitor_spectrum = SpectrumView()
-        layout.addWidget(self.monitor_spectrum, 1)
         self.monitor_file = label(
             "開始・停止・電圧・音圧の時系列は保存フォルダに記録します。", muted=True
         )
@@ -883,8 +879,38 @@ class CalibrationWindow(QMainWindow):
         self.open_monitor_button.setMaximumWidth(180)
         self.open_monitor_button.setEnabled(False)
         layout.addWidget(row(self.monitor_file, self.open_monitor_button))
+        layout.addStretch()
+
+    def _microphone_panel(self):
+        panel = QFrame()
+        panel.setObjectName("microphonePanel")
+        panel.setFixedHeight(230)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self.monitor_start = button("モニターを開始", self._start_monitor, primary=True)
+        self.monitor_start.setMaximumWidth(170)
+        self.spectrum_state = label("待機中 · 入力未取得", muted=True)
+        self.monitor_rms = label("—")
+        self.monitor_peak = label("—")
+        self.monitor_level = label("未校正")
+        header = row(
+            self.monitor_start,
+            self.spectrum_state,
+            label("入力RMS [V]", muted=True),
+            self.monitor_rms,
+            label("入力ピーク [V]", muted=True),
+            self.monitor_peak,
+            label("総音圧 [dB SPL]", muted=True),
+            self.monitor_level,
+        )
+        layout.addWidget(header)
+        self.monitor_spectrum = SpectrumView()
+        self.monitor_spectrum.setMinimumHeight(160)
+        layout.addWidget(self.monitor_spectrum, 1)
         self.monitor_samples = np.empty(0)
         self.monitor_duration_s = 0.0
+        return panel
 
     def _start_monitor(self):
         def start():
@@ -898,10 +924,6 @@ class CalibrationWindow(QMainWindow):
                     reference = None
             simulate, save_capture = self.simulate, self.save_monitor.isChecked()
             output = self._output_path("monitor")
-            self.monitor_samples = np.empty(0)
-            self.monitor_duration_s = 0
-            self.monitor_spectrum.clear()
-            set_text(self.monitor_level, "—" if reference is not None else "未校正")
             set_text(
                 self.monitor_status,
                 "モニター中 · 共通SR: {rate:,} Hz",
@@ -939,6 +961,8 @@ class CalibrationWindow(QMainWindow):
         if item.get("level_note"):
             set_text(self.monitor_level, "帯域計算不可")
         if item["clipped"]:
+            set_text(self.spectrum_state, "入力クリッピング")
+            self.spectrum_state.setStyleSheet("color: #a73338;")
             set_text(
                 self.monitor_status,
                 "入力クリッピング：入力範囲・コンディショナのゲインを確認してください。",
@@ -946,6 +970,8 @@ class CalibrationWindow(QMainWindow):
             self.monitor_status.setStyleSheet("color: #a73338;")
             set_text(self.monitor_level, "クリップ")
         else:
+            set_text(self.spectrum_state, "取得中 · {rate:,} Hz", rate=rate)
+            self.spectrum_state.setStyleSheet("")
             set_text(
                 self.monitor_status,
                 "モニター中 · {duration:.1f} s · {rate:,} Hz",
@@ -1021,15 +1047,18 @@ class CalibrationWindow(QMainWindow):
         fader_layout.addWidget(self.volume_text)
         fader_layout.addWidget(self.volume_fader, 1, Qt.AlignmentFlag.AlignHCenter)
         fader_panel.setMaximumWidth(210)
-        self.playback_spectrum = SpectrumView()
-        layout.addWidget(row(fader_panel, self.playback_spectrum), 1)
-        layout.addWidget(
+        playback_info = QWidget()
+        info_layout = QVBoxLayout(playback_info)
+        info_layout.addWidget(
             label("100%は設定したVpeak上限です。校正済み音圧の指定ではありません。", muted=True)
         )
-        rms, self.playback_rms = metric("入力RMS [V]")
-        spl, self.playback_spl = metric("総音圧 [dB SPL]")
         command, self.playback_peak = metric("AO指令ピーク [V]")
-        layout.addWidget(row(rms, spl, command))
+        info_layout.addWidget(command)
+        info_layout.addWidget(
+            label("入力スペクトラム・電圧・音圧は、どのタブでも画面下部に表示します。", muted=True)
+        )
+        info_layout.addStretch()
+        layout.addWidget(row(fader_panel, playback_info), 1)
         self.playback_status = label("停止中。音声を選択して再生を開始してください。", muted=True)
         layout.addWidget(self.playback_status)
         self.playback_open = button("記録フォルダを開く", self._open_monitor)
@@ -1088,7 +1117,6 @@ class CalibrationWindow(QMainWindow):
             loop, save_capture = self.loop_audio.isChecked(), self.save_playback.isChecked()
             output = self._output_path("playback")
             self.job_output = output
-            self.playback_spectrum.clear()
             set_value(self.playback_peak, "—")
             self._start(
                 "test_playback",
@@ -1126,20 +1154,6 @@ class CalibrationWindow(QMainWindow):
 
     def _playback_frame(self, item):
         self._monitor_frame(item)
-        self.playback_spectrum.set_spectrum(item["spectrum"])
-        set_value(self.playback_rms, self.monitor_rms.text())
-        set_text(
-            self.playback_spl,
-            "クリップ"
-            if item["clipped"]
-            else "未校正"
-            if not item["calibrated"]
-            else "帯域計算不可"
-            if item.get("level_note")
-            else "無信号"
-            if item["level_spl_db"] is None
-            else f"{item['level_spl_db']:.2f}",
-        )
         set_value(self.playback_peak, f"{item['output_peak_v']:.6g}")
         self._hardware_info(item["hardware"])
         set_text(
@@ -1688,6 +1702,14 @@ class CalibrationWindow(QMainWindow):
             else None,
         )
         self.job_kind = kind
+        if kind in {"reference", "calibrate", "monitor", "test_playback"}:
+            self.monitor_samples = np.empty(0)
+            self.monitor_duration_s = 0
+            self.monitor_spectrum.clear()
+            set_text(self.spectrum_state, "入力待ち…")
+            self.spectrum_state.setStyleSheet("")
+            for value in (self.monitor_rms, self.monitor_peak, self.monitor_level):
+                set_text(value, "—")
         self.worker = Operation(task, self)
         self.worker.progress.connect(self._iteration)
         self.worker.finished.connect(self._finished)
@@ -1753,6 +1775,14 @@ class CalibrationWindow(QMainWindow):
         self.progress.setRange(0, 1)
         self.progress.setValue(0 if error else 1)
         self._set_busy(False)
+        if kind in {"reference", "calibrate", "monitor", "test_playback"}:
+            set_text(
+                self.spectrum_state,
+                "停止中 · 最後の入力"
+                if self.monitor_spectrum.spectrum is not None
+                else "停止中 · 入力未取得",
+            )
+            self.spectrum_state.setStyleSheet("")
         try:
             extra = {}
             if error is None and kind in {
