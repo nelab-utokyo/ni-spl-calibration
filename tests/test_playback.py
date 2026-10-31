@@ -115,6 +115,7 @@ def test_playback_records_ao_ai_and_applied_volume_without_reference(tmp_path, l
         simulate=True,
         volume=control,
         loop=loop,
+        save_capture=True,
         cancel_requested=stop.is_set,
         on_frame=update,
     )

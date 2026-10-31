@@ -67,7 +67,7 @@ During capture, the spectrum updates approximately every 100 ms. Frequency is lo
 
 AO stays at 0 V. Monitoring and reference/calibration tasks are mutually exclusive. Use Stop before continuing measurements.
 
-Each `monitor-<timestamp>/` folder stores setup, reference, hardware information, `levels.jsonl` and a final `summary.json` (or a failure record). Raw input recording is enabled by default. Consecutive `capture-*.npz` files contain `samples` in volts, `sample_rate_hz` and `first_sample`; their SHA-256 hashes are recorded in the level log. Disabling raw captures still preserves the level time series and activity log.
+Each `monitor-<timestamp>/` folder stores setup, reference, hardware information, `levels.jsonl` and a final `summary.json` (or a failure record). Raw input recording is **OFF by default**. When enabled, consecutive `capture-*.npz` files contain `samples` in volts, `sample_rate_hz` and `first_sample`; their SHA-256 hashes are recorded in the level log. Leaving raw captures off preserves the level time series and activity log.
 
 ### Test playback
 
@@ -77,9 +77,22 @@ Start playback, then adjust the live fader. 100% corresponds to `max_peak_v`; th
 
 The device, AI/AO channels and commanded AO peak are displayed during playback. The commanded voltage is the program's output value, not a measurement at the analog terminal.
 
-Each `playback-<timestamp>/` records setup, stimulus, optional reference, `playback.json`, `levels.jsonl` and a summary/failure record. Applied fader settings, 10 ms gain ramps and spectra are logged. With raw capture enabled, `capture-*.npz` contains microphone `samples`, the AO `output_v` written, sample rate and starting sample position.
+Each `playback-<timestamp>/` records setup, stimulus, optional reference, `playback.json`, `levels.jsonl` and a summary/failure record. Applied fader settings, 10 ms gain ramps and spectra are logged. Raw AO/microphone recording is **OFF by default**. When enabled, `capture-*.npz` contains microphone `samples`, the AO `output_v` written, sample rate and starting sample position. The source waveform, setup and applied volume history are retained with raw recording off.
 
 Preview emits no audio; standalone microphone monitoring holds AO at 0 V. Use Test playback for an audible check.
+
+### Choose the initial calibration level
+
+`start_scale_v` is the initial **volts per digital unit**. The first peak voltage is `min(start_scale_v * waveform_peak, max_peak_v)`. For example, a waveform peak of 0.5 and an initial scale of 0.01 produce 0.005 Vpeak. Waveform calibration displays this initial Vpeak.
+
+To choose it using playback:
+
+1. Measure the microphone reference and test-play the waveform you will calibrate.
+2. Start low and adjust the fader while watching the input and SPL. Use a level below the target without clipping the microphone input as a starting point.
+3. Click **Use this volume to start calibration**. Playback stops before the applied gain is saved as the initial scale and Waveform calibration opens. Muted or clipped frames and pending fader changes cannot be adopted. The exact prepared waveform is retained, and the selected gain and source playback record are logged.
+4. Check the initial Vpeak, set the target and start calibration. Test playback's total SPL is a guide; the calibration search checks SNR against a separate background measurement.
+
+The iteration table also displays SNR. Insufficient SNR continues the search with bounded upward steps. The default for new setups and the allowed maximum are **10 dB per step** (approximately 3.16 times the voltage). The peak-voltage limit still applies. If SNR remains insufficient at that limit, increasing only the initial scale will not help; check the microphone input, gain and analysis band. Existing setup files and restored runs retain their saved step size.
 
 ## Using commands
 
@@ -218,7 +231,7 @@ This version calibrates the **overall level of each waveform**. It does not flat
 
 If your experiment generates new noise on every trial, distinguish this result for one fixed waveform from the distribution across stimuli. Check level variability using other seeds or a representative waveform set. Calibration supports finite mono waveforms; stereo WAVs can be explicitly mixed/selected to mono. Stereo output and multiple-DAQ synchronization remain outside scope. Test-playback looping is for output checks, not infinite-stream SPL calibration.
 
-The output is constrained by a peak-voltage limit and upward search steps of at most 6 dB. The package attempts to return AO to 0 V after each acquisition, on exceptions, and on Ctrl+C. Input clipping is checked against both voltage rails, including DC offsets and samples outside the analysis window. Software cannot guarantee output reset after operating-system termination, power loss, or disconnection.
+The output is constrained by a peak-voltage limit and upward search steps of at most 10 dB. The package attempts to return AO to 0 V after each acquisition, on exceptions, and on Ctrl+C. Input clipping is checked against both voltage rails, including DC offsets and samples outside the analysis window. Software cannot guarantee output reset after operating-system termination, power loss, or disconnection.
 
 Reference records are tied to the setup identity and DAQ configuration. Detected changes require a new reference measurement. Physical changes such as gain or wiring changes cannot be detected automatically; update `chain_notes`. Recalibrate the stimuli after changing the speaker, microphone position/orientation, room conditions, or other material parts of the acoustic path. JSON/NPZ records are never overwritten, preserving earlier calibrations.
 

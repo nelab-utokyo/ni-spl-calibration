@@ -104,6 +104,7 @@ def test_monitor_read_failure_retains_partial_record(tmp_path, monkeypatch):
             setup,
             output=directory,
             simulate=True,
+            save_capture=True,
             cancel_requested=lambda: False,
             on_frame=lambda frame: None,
         )

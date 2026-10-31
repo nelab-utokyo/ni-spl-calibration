@@ -171,7 +171,8 @@ def test_monitor_updates_records_and_excludes_other_daq_operations(window, app):
     wait_until(app, lambda: view.worker is None)
     assert view.measure_button.isEnabled()
     assert read_json(directory / "summary.json")["captured_samples"] >= 6400
-    assert list(directory.glob("capture-*.npz"))
+    assert not list(directory.glob("capture-*.npz"))
+    assert read_json(directory / "monitor.json")["save_capture"] is False
     assert "停止しました" in view.monitor_status.text()
     events = [read_json(path) for path in view.activity.directory.glob("events/*.json")]
     assert any(
@@ -266,6 +267,9 @@ def test_startup_defaults_to_hardware_without_accessing_daq(app, tmp_path, monke
         assert view.mode.currentText() == "NI DAQ 実機"
         assert view.worker is None
         assert view.reference is None
+        assert not view.save_monitor.isChecked()
+        assert not view.save_playback.isChecked()
+        assert view.editor.setup().measurement.max_upward_step_db == 10
         view.language.setCurrentIndex(1)
         assert view.mode.currentText() == "NI DAQ hardware"
         assert not view.simulate
@@ -404,6 +408,8 @@ def test_test_playback_fader_stereo_monitor_mute_and_mid_file_stop(window, app, 
     summary = read_json(directory / "summary.json")
     assert summary["status"] == "stopped"
     assert summary["duration_s"] < 2  # Stopped inside the original two-second file.
+    assert not list(directory.glob("capture-*.npz"))
+    assert read_json(directory / "playback.json")["save_capture"] is False
     assert view.playback_peak.text() == "0"
     assert view.measure_button.isEnabled()
     assert not view.playback_stop.isEnabled()
@@ -425,3 +431,44 @@ def test_built_in_tone_selection_and_one_shot_test_playback(window, app):
     assert read_json(view.job_output / "summary.json")["status"] == "complete"
     assert view.playback_peak.text() == "0"
     assert view.monitor_spectrum.spectrum is not None
+
+
+def test_playback_volume_is_applied_to_the_first_calibration_output(window, app):
+    view, _ = window
+    view.measure_button.click()
+    wait_until(app, lambda: view.worker is None)
+    reference = view.reference
+    view._choose_test_tone()
+    wait_until(app, lambda: view.worker is None)
+    stimulus = view.stimulus
+    view.playback_start.click()
+    wait_until(app, lambda: view.adopt_start_button.isEnabled())
+    view.volume_fader.setValue(150)
+    # An outstanding fader request is not accepted until hardware plays it.
+    assert not view.adopt_start_button.isEnabled()
+    wait_until(app, lambda: view.adopt_start_button.isEnabled())
+    choice = view._playback_start_choice
+    assert choice["volume_fraction"] == 0.15
+    assert choice["peak_v"] == pytest.approx(0.075)
+    view.language.setCurrentIndex(1)
+    assert view.adopt_start_button.text() == "Use this volume to start calibration"
+    view.adopt_start_button.click()
+    wait_until(app, lambda: view.worker is None)
+    assert view.tabs.currentIndex() == 2
+    assert view.stimulus is stimulus
+    assert view.reference is reference
+    assert view.editor.setup().measurement.start_scale_v == pytest.approx(choice["scale_v"])
+    assert "0.075 Vpeak" in view.start_level_info.text()
+    assert read_json(Path(choice["playback_record"]) / "summary.json")["status"] == "stopped"
+    events = [read_json(path) for path in view.activity.directory.glob("events/*.json")]
+    selected = next(event for event in events if event["action"] == "start_level_selected")
+    assert selected["scale_v"] == choice["scale_v"]
+    view.target.setValue(70)
+    view.calibrate_button.click()
+    wait_until(app, lambda: view.worker is None)
+    result = read_json(view.last_output / "result.json")
+    assert result["iterations"][0]["scale_v"] == pytest.approx(choice["scale_v"])
+    assert result["iterations"][0]["output_peak_v"] == pytest.approx(0.075)
+    assert result["setup"]["measurement"]["start_scale_v"] == choice["scale_v"]
+    view.source_location.setText("a-different-waveform.wav")
+    assert not view.adopt_start_button.isEnabled()

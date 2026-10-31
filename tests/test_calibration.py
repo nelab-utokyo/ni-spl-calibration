@@ -106,7 +106,9 @@ def test_reference_rejects_noise_wrong_frequency_clipping_and_drift(setup):
 
 
 @pytest.mark.parametrize("modulated", [False, True])
-def test_search_recovers_voltage_with_am_and_bounded_steps(setup, modulated):
+@pytest.mark.parametrize("step_db", [6, 10])
+def test_search_recovers_voltage_with_am_and_bounded_steps(setup, modulated, step_db):
+    setup = replace(setup, measurement=replace(setup.measurement, max_upward_step_db=step_db))
     samples = tone()
     if modulated:
         samples *= (1 + np.sin(2 * np.pi * 20 * np.arange(len(samples)) / 20000)) / 2
@@ -136,8 +138,11 @@ def test_search_recovers_voltage_with_am_and_bounded_steps(setup, modulated):
     assert result.measured_spl_db == pytest.approx(70, abs=1e-6)
     assert hardware.resets >= 2
     assert result.iterations[-1]["scale_v"] == result.iterations[-2]["scale_v"]
-    for previous, current in zip(result.iterations, result.iterations[1:]):
-        assert 20 * np.log10(current["scale_v"] / previous["scale_v"]) <= 6.000001
+    upward_steps = [
+        20 * np.log10(current["scale_v"] / previous["scale_v"])
+        for previous, current in zip(result.iterations, result.iterations[1:])
+    ]
+    assert max(upward_steps) == pytest.approx(step_db)
     for output in hardware.outputs:
         assert np.max(np.abs(output)) <= setup.daq.max_peak_v
         assert output[-1] == 0

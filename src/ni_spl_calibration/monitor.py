@@ -22,7 +22,7 @@ def monitor_input(
     output,
     simulate,
     reference=None,
-    save_capture=True,
+    save_capture=False,
     cancel_requested,
     on_frame,
     block_duration_s=0.1,

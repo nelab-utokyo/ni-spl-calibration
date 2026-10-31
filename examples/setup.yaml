@@ -30,7 +30,7 @@ measurement:
   frequency_correction_db: []
   tolerance_db: 0.5
   minimum_snr_db: 10.0
-  max_upward_step_db: 6.0
+  max_upward_step_db: 10.0
   max_iterations: 20
   confirmations: 2
   start_scale_v: 0.001

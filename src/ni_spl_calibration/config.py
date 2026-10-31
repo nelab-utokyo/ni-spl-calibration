@@ -62,7 +62,7 @@ class MeasurementSettings:
     frequency_correction_db: tuple[tuple[float, float], ...] = ()
     tolerance_db: float = 0.5
     minimum_snr_db: float = 10.0
-    max_upward_step_db: float = 6.0
+    max_upward_step_db: float = 10.0
     max_iterations: int = 20
     confirmations: int = 2
     start_scale_v: float = 0.001
@@ -108,8 +108,8 @@ class MeasurementSettings:
                 raise ValueError(f"{name} must be a positive integer")
         if self.confirmations < 2 or self.max_iterations < self.confirmations:
             raise ValueError("Require at least two confirmations within max_iterations")
-        if not 0 < self.input_clip_fraction < 1 or not 0 < self.max_upward_step_db <= 6:
-            raise ValueError("Require 0 < input_clip_fraction < 1 and 0 < max_upward_step_db <= 6")
+        if not 0 < self.input_clip_fraction < 1 or not 0 < self.max_upward_step_db <= 10:
+            raise ValueError("Require 0 < input_clip_fraction < 1 and 0 < max_upward_step_db <= 10")
         if self.tolerance_db <= 0 or self.start_scale_v <= 0:
             raise ValueError("tolerance_db and start_scale_v must be positive")
 

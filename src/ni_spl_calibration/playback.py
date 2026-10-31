@@ -89,7 +89,7 @@ def run_test_playback(
     volume,
     loop=True,
     reference=None,
-    save_capture=True,
+    save_capture=False,
     cancel_requested,
     on_frame,
 ):

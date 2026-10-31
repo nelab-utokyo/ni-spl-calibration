@@ -269,6 +269,11 @@ class SetupEditor(QScrollArea):
             "setPlaceholderText",
             "例: [[0, 0], [1000, 0], [100000, -2.0]]",
         )
+        bind(
+            self.fields["measurement.start_scale_v"],
+            "setToolTip",
+            "探索開始時のV/デジタル値です。初回Vpeakは初期倍率×波形のピークで、出力上限を超えません。テスト再生の音量から設定できます。",
+        )
         layout.addStretch()
         self.setWidget(content)
         self.set_setup(new_setup())
@@ -513,12 +518,15 @@ class CalibrationWindow(QMainWindow):
         self.worker = None
         self.reference = None
         self.stimulus = None
+        self._stimulus_info = None
         self.last_output = None
         self.last_monitor_output = None
         self._closing = False
         self.activity = ActivityLog()
         self._parent_run = None
         self.volume_control = VolumeControl(0.1)
+        self._playback_start_choice = None
+        self._pending_start_choice = None
         content = QWidget()
         self.setCentralWidget(content)
         layout = QVBoxLayout(content)
@@ -696,6 +704,10 @@ class CalibrationWindow(QMainWindow):
         self.preview_button.setMaximumWidth(160)
         self.stimulus_info = label("波形が未選択です。", muted=True)
         layout.addWidget(row(self.preview_button, self.stimulus_info))
+        self.start_level_info = label(
+            "波形を確認すると、探索開始時のピーク電圧を表示します。", muted=True
+        )
+        layout.addWidget(self.start_level_info)
         self.waveform = WaveformView()
         layout.addWidget(self.waveform)
         self.target = TargetInput()
@@ -715,8 +727,11 @@ class CalibrationWindow(QMainWindow):
         scale_card, self.scale_value = metric("電圧倍率 [V / デジタル値]")
         peak_card, self.peak_value = metric("出力ピーク [V]")
         layout.addWidget(row(level_card, scale_card, peak_card))
-        self.iterations = QTableWidget(0, 4)
-        set_headers(self.iterations, ["探索回", "実測音圧 [dB SPL]", "出力ピーク [V]", "誤差 [dB]"])
+        self.iterations = QTableWidget(0, 5)
+        set_headers(
+            self.iterations,
+            ["探索回", "実測音圧 [dB SPL]", "出力ピーク [V]", "誤差 [dB]", "SNR [dB]"],
+        )
         self.iterations.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.iterations.verticalHeader().hide()
         self.iterations.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -858,7 +873,7 @@ class CalibrationWindow(QMainWindow):
         )
         self.save_monitor = QCheckBox("生のマイク入力も保存する (NPZ)")
         set_text(self.save_monitor, "生のマイク入力も保存する (NPZ)")
-        self.save_monitor.setChecked(True)
+        self.save_monitor.setChecked(False)
         layout.addWidget(self.save_monitor)
         self.monitor_status = label("停止中。基準がなくても電圧波形を確認できます。", muted=True)
         layout.addWidget(self.monitor_status)
@@ -1023,7 +1038,7 @@ class CalibrationWindow(QMainWindow):
         self.loop_audio.setChecked(True)
         self.save_playback = QCheckBox()
         set_text(self.save_playback, "AO・マイクの生データを保存")
-        self.save_playback.setChecked(True)
+        self.save_playback.setChecked(False)
         self.mute_button = button("ミュート", lambda: self.volume_fader.setValue(0))
         layout.addWidget(
             row(
@@ -1057,10 +1072,19 @@ class CalibrationWindow(QMainWindow):
         info_layout.addWidget(
             label("入力スペクトラム・電圧・音圧は、どのタブでも画面下部に表示します。", muted=True)
         )
+        self.adopt_start_button = button("この音量を探索開始に使う", self._use_playback_as_start)
+        self.adopt_start_button.setEnabled(False)
+        info_layout.addWidget(self.adopt_start_button)
         info_layout.addStretch()
         layout.addWidget(row(fader_panel, playback_info), 1)
         self.playback_status = label("停止中。音声を選択して再生を開始してください。", muted=True)
         layout.addWidget(self.playback_status)
+        layout.addWidget(
+            label(
+                "小さい音量から調節し、入力がクリップせず目標音圧より低いレベルを目安にします。採用すると再生を停止し、波形校正へ進みます。SNRは校正中に背景音と比較して判定します。",
+                muted=True,
+            )
+        )
         self.playback_open = button("記録フォルダを開く", self._open_monitor)
         self.playback_open.setEnabled(False)
         layout.addWidget(self.playback_open)
@@ -1078,6 +1102,62 @@ class CalibrationWindow(QMainWindow):
             "{volume:.1f}%\n上限 {peak:.6g} Vpeak",
             volume=fraction * 100,
             peak=peak,
+        )
+        self._update_adopt_button()
+
+    def _update_adopt_button(self):
+        if not hasattr(self, "adopt_start_button"):
+            return
+        choice = self._playback_start_choice
+        available = (
+            choice is not None
+            and self._pending_start_choice is None
+            and (self.worker is None or self.job_kind == "test_playback")
+            and math.isclose(choice["volume_fraction"], self.volume_control.get(), abs_tol=1e-12)
+        )
+        self.adopt_start_button.setEnabled(available)
+
+    def _use_playback_as_start(self):
+        def adopt():
+            if not self.adopt_start_button.isEnabled():
+                return
+            choice = self._playback_start_choice
+            if self.worker is not None:
+                self._pending_start_choice = choice
+                self._update_adopt_button()
+                self._request_stop()
+            else:
+                self._apply_start_choice(choice)
+
+        self._guard(adopt)
+
+    def _apply_start_choice(self, choice):
+        setup = self.editor.setup()
+        if (
+            self.stimulus is None
+            or self._stimulus_info["sha256"] != choice["stimulus_sha256"]
+            or asdict(setup.daq) != choice["daq"]
+            or self.simulate != choice["simulate"]
+        ):
+            raise ValueError(
+                translate(self, "波形または設定が変わっています。テスト再生で再確認してください。")
+            )
+        self._audit("start_level_selected", **choice)
+        field = self.editor.fields["measurement.start_scale_v"]
+        blocker = QSignalBlocker(field)
+        field.setText(repr(choice["scale_v"]))
+        del blocker
+        self._clear_results()
+        self._refresh()
+        self.tabs.setCurrentIndex(2)
+        area = self.tabs.widget(2)
+        if isinstance(area, QScrollArea):
+            area.ensureWidgetVisible(self.calibrate_button, 0, 20)
+        set_text(
+            self.status,
+            "探索開始を {peak:.6g} Vpeak（倍率 {scale:.6g} V/デジタル値）に設定しました。目標音圧を指定して校正を開始してください。",
+            peak=choice["peak_v"],
+            scale=choice["scale_v"],
         )
 
     def _choose_test_source(self):
@@ -1117,6 +1197,8 @@ class CalibrationWindow(QMainWindow):
             loop, save_capture = self.loop_audio.isChecked(), self.save_playback.isChecked()
             output = self._output_path("playback")
             self.job_output = output
+            self._playback_start_choice = None
+            self._pending_start_choice = None
             set_value(self.playback_peak, "—")
             self._start(
                 "test_playback",
@@ -1154,6 +1236,21 @@ class CalibrationWindow(QMainWindow):
 
     def _playback_frame(self, item):
         self._monitor_frame(item)
+        self._playback_start_choice = (
+            {
+                "stimulus_sha256": self._stimulus_info["sha256"],
+                "daq": asdict(self.editor.setup().daq),
+                "simulate": self.simulate,
+                "scale_v": float(item["scale_end_v"]),
+                "peak_v": float(item["scale_end_v"] * self._stimulus_info["digital_peak"]),
+                "volume_fraction": item["volume_fraction"],
+                "playback_record": str(self.job_output),
+                "first_sample": item["first_sample"],
+            }
+            if not item["clipped"] and item["volume_fraction"] > 0
+            else None
+        )
+        self._update_adopt_button()
         set_value(self.playback_peak, f"{item['output_peak_v']:.6g}")
         self._hardware_info(item["hardware"])
         set_text(
@@ -1334,6 +1431,7 @@ class CalibrationWindow(QMainWindow):
             if self.simulate
             else "NI DAQ 実機：設定したAI/AOで測定します。開始前に接続と測定位置を確認してください。",
         )
+        self._playback_start_choice = None
         self._clear_results()
         self._refresh()
 
@@ -1367,6 +1465,8 @@ class CalibrationWindow(QMainWindow):
 
     def _invalidate_stimulus(self):
         self.stimulus = None
+        self._stimulus_info = None
+        self._playback_start_choice = None
         self.waveform.set_stimulus(None)
         set_text(self.stimulus_info, "波形を確認するか、そのまま校正を開始してください。")
         self._clear_results()
@@ -1376,6 +1476,8 @@ class CalibrationWindow(QMainWindow):
         )
 
     def _refresh(self):
+        self._update_adopt_button()
+        self._update_start_level_info()
         if self.worker is not None:
             return
         try:
@@ -1513,6 +1615,7 @@ class CalibrationWindow(QMainWindow):
         self.stimulus = stimulus
         self.waveform.set_stimulus(stimulus)
         info = stimulus.describe()
+        self._stimulus_info = info
         conversion = stimulus.provenance.get("resampling")
         rate = f"{stimulus.sample_rate_hz:,} Hz"
         if conversion:
@@ -1560,6 +1663,28 @@ class CalibrationWindow(QMainWindow):
                 rms=info["digital_rms"],
                 peak=info["digital_peak"],
             )
+        self._update_start_level_info()
+
+    def _update_start_level_info(self):
+        if self.stimulus is None:
+            set_text(
+                self.start_level_info, "波形を確認すると、探索開始時のピーク電圧を表示します。"
+            )
+            return
+        try:
+            setup = self.editor.setup()
+        except (ValueError, TypeError):
+            set_text(self.start_level_info, "設定の入力を確認してください。")
+            return
+        peak = self._stimulus_info["digital_peak"]
+        set_text(
+            self.start_level_info,
+            "探索開始: {voltage:.6g} Vpeak（初期倍率 {scale:.6g} × 波形ピーク {peak:.6g}、上限 {limit:.6g} Vpeak）。テスト再生の音量から開始値を選べます。",
+            voltage=min(setup.measurement.start_scale_v * peak, setup.daq.max_peak_v),
+            scale=setup.measurement.start_scale_v,
+            peak=peak,
+            limit=setup.daq.max_peak_v,
+        )
 
     def _output_path(self, kind):
         text = self.output_root.text().strip()
@@ -1686,6 +1811,7 @@ class CalibrationWindow(QMainWindow):
         self.volume_fader.setEnabled(not busy or playing)
         self.mute_button.setEnabled(not busy or playing)
         self.playback_stop.setEnabled(playing)
+        self._update_adopt_button()
         set_text(self.stop_button, "停止")
         if not busy:
             self._refresh()
@@ -1752,6 +1878,7 @@ class CalibrationWindow(QMainWindow):
             "SNR不足" if level is None else f"{level:.3f}",
             f"{item['output_peak_v']:.6g}",
             "—" if error is None else f"{error:+.3f}",
+            "—" if item["signal_to_noise_db"] is None else f"{item['signal_to_noise_db']:.1f}",
         ]
         for column, value in enumerate(values):
             cell = (
@@ -1764,6 +1891,17 @@ class CalibrationWindow(QMainWindow):
         self.progress.setValue(item["iteration"])
         set_text(self.level_value, "SNR不足" if level is None else f"{level:.2f}")
         set_value(self.peak_value, f"{item['output_peak_v']:.6g}")
+        if level is None:
+            set_text(
+                self.calibration_hint,
+                "SNR不足：出力を最大 {step:g} dBずつ上げて探索を続けます。",
+                step=self.editor.setup().measurement.max_upward_step_db,
+            )
+        else:
+            set_text(
+                self.calibration_hint,
+                "SNR条件を満たしています。目標音圧への収束を確認しています。",
+            )
 
     @Slot()
     def _finished(self):
@@ -1887,6 +2025,14 @@ class CalibrationWindow(QMainWindow):
             self.playback_open.setEnabled(True)
         if kind in {"reference", "calibrate", "test_playback"}:
             set_text(self.monitor_status, "取得終了。最後の入力スペクトラムを表示しています。")
+        if kind == "test_playback":
+            choice = self._pending_start_choice
+            self._pending_start_choice = None
+            if error is not None:
+                self._playback_start_choice = None
+            elif choice is not None and not self._closing:
+                self._guard(lambda: self._apply_start_choice(choice))
+            self._update_adopt_button()
         if self._closing:
             self.close()
 
