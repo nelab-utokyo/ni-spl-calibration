@@ -54,13 +54,24 @@ class LiveMeter:
         self.pending = np.concatenate((self.pending, samples))
         while len(self.pending) >= self.block_size:
             values, self.pending = self.pending[: self.block_size], self.pending[self.block_size :]
+            self._emit(values)
+
+    def flush(self):
+        """Display the final short frame without mixing background and playback."""
+        values, self.pending = self.pending, np.empty(0)
+        if len(values) >= 16:
+            self._emit(values)
+        else:
             self.received += len(values)
-            self.emit(
-                {
-                    "kind": "monitor",
-                    "samples": values,
-                    "sample_rate_hz": self.setup.daq.sample_rate_hz,
-                    "duration_s": self.received / self.setup.daq.sample_rate_hz,
-                    **input_metrics(values, self.setup, self.reference),
-                }
-            )
+
+    def _emit(self, values):
+        self.received += len(values)
+        self.emit(
+            {
+                "kind": "monitor",
+                "samples": values,
+                "sample_rate_hz": self.setup.daq.sample_rate_hz,
+                "duration_s": self.received / self.setup.daq.sample_rate_hz,
+                **input_metrics(values, self.setup, self.reference),
+            }
+        )

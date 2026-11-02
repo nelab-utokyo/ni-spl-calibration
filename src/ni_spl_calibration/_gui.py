@@ -63,6 +63,13 @@ from .calibration import (
     measurement_bounds,
     validate_reference,
 )
+from .comparison import (
+    ComparisonRecord,
+    load_comparison,
+    load_comparison_source,
+    run_comparison,
+    validate_sources,
+)
 from .config import DaqSettings, MeasurementSettings, Setup, load_setup
 from .i18n import (
     Message,
@@ -810,6 +817,7 @@ class CalibrationWindow(QMainWindow):
         self._pause_after = Event()
         self.last_plan = None
         self._queue_setup = None
+        self.comparison_dialog = None
         content = QWidget()
         self.setCentralWidget(content)
         layout = QVBoxLayout(content)
@@ -1069,7 +1077,9 @@ class CalibrationWindow(QMainWindow):
         self.manual_start_button = button("指定した初期倍率を採用", self._adopt_manual_start)
         search_layout.addWidget(self.manual_start_button, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(disclosure("探索条件・初期倍率を直接指定", search))
-        self._page_actions(self.calibrate_button, self.calibration_hint)
+        self.compare_button = button("校正値で測定", lambda: self._guard(self._open_comparison))
+        self.compare_button.setEnabled(False)
+        self._page_actions(self.calibrate_button, self.compare_button, self.calibration_hint)
 
     def _show_error(self, error):
         notes = "".join(f"\n{note}" for note in getattr(error, "__notes__", []))
@@ -1105,7 +1115,12 @@ class CalibrationWindow(QMainWindow):
         layout.addWidget(self.history, 1)
         self.history_info = label("保存フォルダ内の実行履歴を表示します。", muted=True)
         layout.addWidget(self.history_info)
-        layout.addWidget(button("選択した実行の条件を復元", self._restore_selected, primary=True))
+        layout.addWidget(
+            row(
+                button("選択した実行の条件を復元", self._restore_selected, primary=True),
+                button("校正値で測定", lambda: self._guard(self._compare_history)),
+            )
+        )
 
     def _scan_history(self):
         def scan():
@@ -1161,12 +1176,133 @@ class CalibrationWindow(QMainWindow):
         def task(cancelled, progress):
             if cancelled():
                 raise MeasurementCancelled("Measurement cancelled")
-            result = load_plan(path) if (Path(path) / "plan.json").is_file() else load_replay(path)
+            result = (
+                load_comparison(path)
+                if (Path(path) / "comparison.json").is_file()
+                else load_plan(path)
+                if (Path(path) / "plan.json").is_file()
+                else load_replay(path)
+            )
             if cancelled():
                 raise MeasurementCancelled("Measurement cancelled")
             return result
 
         self._guard(lambda: self._start("restore", task))
+
+    def _comparison_jobs(self):
+        selected = self._selected_job_ids(self.queue_table)
+        return [job for job in self.jobs if job.id in selected]
+
+    def _open_comparison(self):
+        jobs = self._comparison_jobs()
+        if not jobs or any(
+            job.status != "complete" or job.result is None or job.output is None for job in jobs
+        ):
+            raise ValueError(translate(self, "成功した校正結果を選択してください"))
+        requests = [(job.output, job.name, job.group) for job in jobs]
+
+        def task(cancelled, progress):
+            sources = []
+            for directory, name, group in requests:
+                if cancelled():
+                    raise MeasurementCancelled("Measurement cancelled")
+                sources.append(load_comparison_source(directory, name=name, group=group))
+            validate_sources(sources)
+            return ComparisonRecord(None, sources)
+
+        self._start("comparison_prepare", task)
+
+    def _compare_history(self):
+        row_number = self.history.currentRow()
+        if row_number < 0:
+            raise ValueError(translate(self, "成功した校正結果を選択してください"))
+        path = Path(self.history.item(row_number, 0).data(Qt.ItemDataRole.UserRole))
+
+        def task(cancelled, progress):
+            if cancelled():
+                raise MeasurementCancelled("Measurement cancelled")
+            if (path / "comparison.json").is_file():
+                return load_comparison(path)
+            if (path / "plan.json").is_file():
+                plan = load_plan(path)
+                sources = []
+                for job in plan.jobs:
+                    if cancelled():
+                        raise MeasurementCancelled("Measurement cancelled")
+                    if job.status == "complete" and job.output is not None:
+                        sources.append(
+                            load_comparison_source(job.output, name=job.name, group=job.group)
+                        )
+            else:
+                sources = [load_comparison_source(path)]
+            validate_sources(sources)
+            return ComparisonRecord(None, sources)
+
+        self._start("comparison_restore", task)
+
+    def _show_comparison(self, record, *, restore_setup=False):
+        if restore_setup:
+            # Position labels never modify setup identity or microphone sensitivity.
+            self._apply_replay(record.sources[0].replay)
+        if self.comparison_dialog is None:
+            from ._comparison_gui import ComparisonDialog
+
+            self.comparison_dialog = ComparisonDialog(self)
+            self.comparison_dialog.move(self.tabs.mapToGlobal(self.tabs.rect().topLeft()))
+        self.comparison_dialog.set_sources(
+            record.sources, rows=record.rows, output=record.directory
+        )
+        self.comparison_dialog.show()
+        self.comparison_dialog.raise_()
+        retranslate(self)
+
+    def _start_comparison(self):
+        if self.worker is not None:
+            raise ValueError(translate(self, "別の処理が実行中です。"))
+        dialog = self.comparison_dialog
+        if dialog is None or not dialog.sources:
+            return
+        sources = list(dialog.sources)
+        setup = sources[0].replay.setup
+        backend = "simulation" if self.simulate else "ni-daqmx"
+        if (
+            backend != sources[0].replay.backend
+            or self.editor.setup().reference_fingerprint != setup.reference_fingerprint
+        ):
+            raise ValueError(
+                translate(self, "測定モード・入力系・DAQ設定を校正時と合わせてください")
+            )
+        if not self._confirm_hardware(setup):
+            return
+        position = dialog.position.text().strip() or translate(
+            self, "位置 {number}", number=dialog.sequence + 1
+        )
+        save_capture = dialog.save_capture.isChecked()
+        output = self._output_path("comparison")
+        self.job_output = output
+        self._audit(
+            "comparison_requested",
+            position=position,
+            save_capture=save_capture,
+            calibrations=[
+                {"directory": str(s.replay.directory), "result_sha256": s.result_sha256}
+                for s in sources
+            ],
+        )
+        dialog.begin(output)
+        self._start(
+            "comparison",
+            lambda cancelled, progress: run_comparison(
+                output,
+                sources,
+                position=position,
+                save_capture=save_capture,
+                cancel_requested=cancelled,
+                on_progress=progress,
+                hardware_factory=make_hardware,
+            ),
+            max_iterations=len(sources),
+        )
 
     def _microphone_panel(self):
         panel = QFrame()
@@ -1176,6 +1312,10 @@ class CalibrationWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
         layout.addWidget(self.editor.band)
+        self.comparison_band_info = label("", muted=True)
+        self.comparison_band_info.setFixedHeight(self.editor.band.sizeHint().height())
+        self.comparison_band_info.hide()
+        layout.addWidget(self.comparison_band_info)
         self.monitor_start = button("マイク確認", self._toggle_monitor)
         self.monitor_start.setMaximumWidth(116)
         self.spectrum_state = label("待機中", muted=True)
@@ -2332,6 +2472,9 @@ class CalibrationWindow(QMainWindow):
         self._update_start_level_info()
         if self.worker is not None:
             return
+        self.compare_button.setEnabled(False)
+        if self.comparison_dialog is not None:
+            self.comparison_dialog.set_busy(False)
         try:
             setup = self.editor.setup()
         except (ValueError, TypeError) as error:
@@ -2432,6 +2575,14 @@ class CalibrationWindow(QMainWindow):
                     [],
                 )
         self._update_job_tables(setup)
+        jobs = self._comparison_jobs()
+        self.compare_button.setEnabled(
+            bool(jobs)
+            and all(
+                j.status == "complete" and j.result is not None and j.output is not None
+                for j in jobs
+            )
+        )
         set_text(
             self.preparation_count,
             "準備 {ready} / {count}",
@@ -2772,6 +2923,8 @@ class CalibrationWindow(QMainWindow):
         set_text(self.monitor_start, "停止" if monitoring else "マイク確認")
         self._update_adopt_button()
         set_text(self.stop_button, "停止")
+        if self.comparison_dialog is not None:
+            self.comparison_dialog.set_busy(busy)
         if not busy:
             self._refresh()
 
@@ -2783,11 +2936,11 @@ class CalibrationWindow(QMainWindow):
             operation=kind,
             context=self._context(),
             output=str(self.job_output)
-            if kind in {"reference", "calibrate", "queue", "monitor", "test_playback"}
+            if kind in {"reference", "calibrate", "queue", "comparison", "monitor", "test_playback"}
             else None,
         )
         self.job_kind = kind
-        if kind in {"reference", "calibrate", "queue", "monitor", "test_playback"}:
+        if kind in {"reference", "calibrate", "queue", "comparison", "monitor", "test_playback"}:
             self.monitor_samples = np.empty(0)
             self.monitor_duration_s = 0
             self.monitor_spectrum.clear()
@@ -2817,12 +2970,45 @@ class CalibrationWindow(QMainWindow):
                 "restore": "実行記録を照合して、条件を復元しています…",
                 "monitor": "マイク確認中",
                 "test_playback": "テスト再生中",
+                "comparison_prepare": "実行記録を照合して、条件を復元しています…",
+                "comparison_restore": "実行記録を照合して、条件を復元しています…",
+                "comparison": "条件を保存中…",
             }[kind],
         )
         self.worker.start()
 
     @Slot(dict)
     def _iteration(self, item):
+        if item.get("kind", "").startswith("comparison_"):
+            self.comparison_dialog.progress(item)
+            if item["kind"] == "comparison_phase":
+                set_text(
+                    self.status,
+                    "背景音を測定中 · {duration:g} s"
+                    if item["phase"] == "background"
+                    else "固定倍率で再生中 · {duration:g} s",
+                    duration=item["duration_s"],
+                )
+            elif item["kind"] == "comparison_source":
+                source = next(
+                    s for s in self.comparison_dialog.sources if s.id == item["source_id"]
+                )
+                self.monitor_spectrum.analysis_band = source.replay.setup.measurement.band_hz
+                band = source.replay.setup.measurement.band_hz
+                self.editor.band.hide()
+                self.comparison_band_info.show()
+                if band is None:
+                    set_text(self.comparison_band_info, "比較測定 · 音圧計算帯域：全帯域")
+                else:
+                    set_text(
+                        self.comparison_band_info,
+                        "比較測定 · 音圧計算帯域：{low:g}–{high:g} Hz",
+                        low=band[0],
+                        high=band[1],
+                    )
+                self.monitor_spectrum.clear()
+                self.progress.setValue(item["index"] - 1)
+            return
         if item.get("kind") == "queue_job":
             self.job_output = Path(item["output"])
             job = next(j for j in self.jobs if j.id == item["job_id"])
@@ -2937,7 +3123,12 @@ class CalibrationWindow(QMainWindow):
         self.progress.setRange(0, 1)
         self.progress.setValue(0 if error else 1)
         self._set_busy(False)
-        if kind in {"reference", "calibrate", "queue", "monitor", "test_playback"}:
+        if kind == "comparison":
+            self.comparison_band_info.hide()
+            self.editor.band.show()
+            set_text(self.monitor_level, "—")
+            self.level_meter.set_levels(None, self.level_meter.target)
+        if kind in {"reference", "calibrate", "queue", "comparison", "monitor", "test_playback"}:
             set_text(
                 self.spectrum_state,
                 "停止 · 最終入力" if self.monitor_spectrum.spectrum is not None else "待機中",
@@ -2966,6 +3157,12 @@ class CalibrationWindow(QMainWindow):
                         for job in result
                     ]
                 }
+            elif error is None and (
+                kind in {"comparison_prepare", "comparison_restore"}
+                or kind == "restore"
+                and isinstance(result, ComparisonRecord)
+            ):
+                extra = {"calibrations": [str(s.replay.directory) for s in result.sources]}
             elif error is None and kind == "restore":
                 extra = (
                     {"plan": str(result.directory), "job_ids": [job.id for job in result.jobs]}
@@ -2982,6 +3179,8 @@ class CalibrationWindow(QMainWindow):
                 if isinstance(error, MeasurementCancelled)
                 else "failed"
                 if error
+                else result["status"]
+                if kind == "comparison"
                 else "held"
                 if kind == "queue" and result["status"] == "held"
                 else "complete",
@@ -2989,13 +3188,41 @@ class CalibrationWindow(QMainWindow):
                 output=str(result["directory"])
                 if kind == "queue" and result is not None
                 else str(self.job_output)
-                if kind in {"reference", "calibrate", "queue", "monitor", "test_playback"}
+                if kind
+                in {"reference", "calibrate", "queue", "comparison", "monitor", "test_playback"}
                 else None,
                 notes=getattr(error, "__notes__", []) if error else [],
                 **extra,
             )
         except Exception as log_error:
             self._show_error(log_error)
+            if self._closing:
+                self.close()
+            return
+        if kind == "comparison":
+            self.comparison_dialog.finish(result, error)
+            self._scan_history()
+            set_text(
+                self.status,
+                "比較測定を保存しました"
+                if error is None and result["status"] == "complete"
+                else "比較測定を中断しました",
+            )
+            if (
+                error is not None
+                and not isinstance(error, MeasurementCancelled)
+                and not self._closing
+            ):
+                self._show_error(error)
+            if self._closing:
+                self.close()
+            return
+        if error is None and (
+            kind in {"comparison_prepare", "comparison_restore"}
+            or kind == "restore"
+            and isinstance(result, ComparisonRecord)
+        ):
+            self._show_comparison(result, restore_setup=kind != "comparison_prepare")
             if self._closing:
                 self.close()
             return
@@ -3132,11 +3359,14 @@ class CalibrationWindow(QMainWindow):
                 return
             self.stop_button.setEnabled(False)
             self.monitor_start.setEnabled(False)
+            if self.job_kind == "comparison" and self.comparison_dialog is not None:
+                self.comparison_dialog.stop_button.setEnabled(False)
             set_text(self.stop_button, "停止待ち…")
             set_text(
                 self.status,
                 "停止要求済み：短い取得単位で中断し、AOを0 Vへ戻します。"
-                if self.job_kind in {"reference", "calibrate", "queue", "monitor", "test_playback"}
+                if self.job_kind
+                in {"reference", "calibrate", "queue", "comparison", "monitor", "test_playback"}
                 else "停止要求済み：波形準備の完了後に終了します。",
             )
 
@@ -3158,6 +3388,8 @@ class CalibrationWindow(QMainWindow):
             self._request_stop()
             event.ignore()
         else:
+            if self.comparison_dialog is not None:
+                self.comparison_dialog.close()
             event.accept()
 
 

@@ -144,9 +144,30 @@ def find_runs(root):
         path.parent for pattern in ("*/run.json", "*/result.json") for path in root.glob(pattern)
     }
     directories.update(path.parent for path in root.glob("*/plan.json"))
+    directories.update(path.parent for path in root.glob("*/comparison.json"))
     records = []
     for directory in sorted(directories, reverse=True):
         try:
+            comparison = directory / "comparison.json"
+            if comparison.is_file():
+                payload = read_json(comparison)
+                summary_path = directory / "summary.json"
+                summary = read_json(summary_path) if summary_path.is_file() else {}
+                status = summary.get("status", "incomplete")
+                if status == "complete" and any(
+                    row["status"] != "complete" for row in summary["rows"]
+                ):
+                    status = "incomplete"
+                records.append(
+                    {
+                        "directory": directory,
+                        "created_at": payload["created_at"],
+                        "status": status,
+                        "target_spl_db": "—",
+                        "backend": payload["backend"],
+                    }
+                )
+                continue
             plan_path = directory / "plan.json"
             if plan_path.is_file():
                 plan = read_json(plan_path)

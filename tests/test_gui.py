@@ -753,3 +753,226 @@ def test_single_stimulus_can_be_recalibrated_without_changing_execution_scope(wi
     assert view.jobs[0].result is None
     assert view.jobs[0].status == "pending"
     assert not view.jobs[0].ready(view.editor.setup(), True)
+
+
+def calibrate_comparison_source(view, app):
+    view._choose_test_tone()
+    wait_until(app, lambda: view.worker is None)
+    view._measure_reference()
+    wait_until(app, lambda: view.worker is None)
+    view._calibrate()
+    wait_until(app, lambda: view.worker is None)
+    assert view.compare_button.isEnabled()
+
+
+def test_fixed_gain_comparison_repeated_positions_language_and_original_result(
+    window, app, monkeypatch
+):
+    from ni_spl_calibration.calibration import apply_calibration, load_result
+    from ni_spl_calibration.comparison import load_comparison
+
+    view, _ = window
+    assert not view.compare_button.isEnabled()
+    calibrate_comparison_source(view, app)
+    original_output = view.last_output
+    original_bytes = (original_output / "result.json").read_bytes()
+    original_setup, original_waveform = view.editor.setup(), view.stimulus
+    calibration_metrics = (view.level_value.text(), view.scale_value.text(), view.peak_value.text())
+    response, outputs = [0.5], []
+
+    class Moved(SimulatedHardware):
+        def play_and_record(self, output, **options):
+            outputs.append(output.copy())
+            return response[0] * super().play_and_record(output, **options)
+
+    def no_hardware(*args, **kwargs):
+        pytest.fail("Opening a comparison window must not access DAQ")
+
+    monkeypatch.setattr(gui, "make_hardware", no_hardware)
+    view.compare_button.click()
+    wait_until(app, lambda: view.worker is None)
+    dialog = view.comparison_dialog
+    assert dialog.isVisible()
+    assert not dialog.save_capture.isChecked()
+    assert not hasattr(dialog, "volume_fader")
+    monkeypatch.setattr(gui, "make_hardware", lambda setup, **kw: Moved(setup.daq))
+    dialog.position.setText("20 cm {value}")
+    dialog.start_button.click()
+    wait_until(app, lambda: view.worker is None)
+    first = dialog.last_output
+    assert dialog.rows[-1]["delta_db"] == pytest.approx(-6.0206, abs=0.002)
+    assert dialog.difference.text() == "-6.02"
+    np.testing.assert_array_equal(
+        outputs[0],
+        np.append(
+            apply_calibration(original_waveform, load_result(original_output / "result.json")), 0
+        ),
+    )
+    assert dialog.rows[-1]["position"] == "20 cm {value}"
+    assert not list(first.glob("*-input.npz"))
+    assert (
+        load_comparison(first).rows[-1]["scale_v"]
+        == load_result(original_output / "result.json").scale_v
+    )
+    view.language.setCurrentIndex(1)
+    assert dialog.windowTitle() == "Position comparison"
+    assert dialog.start_button.text() == "Play / measure"
+    assert dialog.position.text() == "20 cm {value}"
+    assert dialog.history.item(0, 5).text() == "Complete"
+    response[0] = 2
+    dialog.position.setText("30 cm")
+    dialog.start_button.click()
+    wait_until(app, lambda: view.worker is None)
+    assert dialog.last_output != first
+    assert dialog.history.rowCount() == 2
+    assert dialog.difference.text() == "+6.02"
+    np.testing.assert_array_equal(outputs[0], outputs[1])
+    assert view.editor.setup() == original_setup
+    assert view.stimulus is original_waveform
+    assert (
+        view.level_value.text(),
+        view.scale_value.text(),
+        view.peak_value.text(),
+    ) == calibration_metrics
+    assert (original_output / "result.json").read_bytes() == original_bytes
+    assert view.jobs[0].status == "complete"
+    view.editor.fields["chain_notes"].setPlainText("Different microphone and input gain")
+    assert not dialog.start_button.isEnabled()
+
+
+def test_multi_stimulus_comparison_and_settings_guard(window, app, tmp_path):
+    view, _ = window
+    view._measure_reference()
+    wait_until(app, lambda: view.worker is None)
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"compare-{index}.wav"
+        sf.write(
+            path, 0.4 * np.sin(2 * np.pi * (1000 + 500 * index) * np.arange(6400) / 32000), 32000
+        )
+        paths.append(path)
+    view._import_sources(paths)
+    wait_until(app, lambda: view.worker is None)
+    for job in view.jobs:
+        view._activate_job(job.id)
+        view._adopt_manual_start()
+    view._calibrate()
+    wait_until(app, lambda: view.worker is None)
+    view.queue_table.selectAll()
+    assert view.compare_button.isEnabled()
+    view.compare_button.click()
+    wait_until(app, lambda: view.worker is None)
+    dialog = view.comparison_dialog
+    assert len(dialog.sources) == 2
+    assert dialog.start_button.text() == "2件を再生・測定"
+    for path in paths:
+        path.unlink()
+    dialog.start_button.click()
+    wait_until(app, lambda: view.worker is None)
+    assert dialog.history.rowCount() == 2
+    assert [r["name"] for r in dialog.rows] == ["compare-0.wav", "compare-1.wav"]
+    assert all(abs(r["delta_db"]) < 0.01 for r in dialog.rows)
+    view.editor.fields["daq.max_peak_v"].setText("0.3")
+    assert not dialog.start_button.isEnabled()
+    assert not view.compare_button.isEnabled()
+    view.editor.fields["daq.max_peak_v"].setText("0.5")
+    assert dialog.start_button.isEnabled()
+    view.mode.setCurrentIndex(1)
+    assert not dialog.start_button.isEnabled()
+
+
+def test_comparison_records_restore_from_history_without_audio(window, app, monkeypatch):
+    view, _ = window
+    calibrate_comparison_source(view, app)
+    view._open_comparison()
+    wait_until(app, lambda: view.worker is None)
+    view.comparison_dialog.position.setText("B")
+    view.comparison_dialog.start_button.click()
+    wait_until(app, lambda: view.worker is None)
+    directory = view.comparison_dialog.last_output
+    view.comparison_dialog.close()
+    view.editor.fields["daq.sample_rate_hz"].setText("48000")
+    view.mode.setCurrentIndex(1)
+
+    def unexpected_hardware(*args, **kwargs):
+        pytest.fail("Restoring a comparison record must not play audio")
+
+    factory = gui.make_hardware
+    monkeypatch.setattr(gui, "make_hardware", unexpected_hardware)
+    view._restore(directory)
+    wait_until(app, lambda: view.worker is None)
+    assert view.comparison_dialog.isVisible()
+    assert view.simulate
+    assert view.editor.setup().daq.sample_rate_hz == 32000
+    assert view.comparison_dialog.start_button.isEnabled()
+    assert (
+        view.comparison_dialog.history.item(view.comparison_dialog.history.rowCount() - 1, 0).text()
+        == "B"
+    )
+    assert view.comparison_dialog.current.text() != "—"
+    monkeypatch.setattr(gui, "make_hardware", factory)
+    view.comparison_dialog.position.setText("C")
+    view.comparison_dialog.start_button.click()
+    wait_until(app, lambda: view.worker is None)
+    assert view.comparison_dialog.last_output != directory
+    assert view.comparison_dialog.rows[-1]["position"] == "C"
+
+
+@pytest.mark.parametrize("close_main", [False, True])
+def test_comparison_close_during_playback_cancels_and_resets(window, app, monkeypatch, close_main):
+    view, _ = window
+    calibrate_comparison_source(view, app)
+    view._open_comparison()
+    wait_until(app, lambda: view.worker is None)
+    entered, release = Event(), Event()
+
+    class Blocking(SimulatedHardware):
+        resets = 0
+
+        def reset_output(self):
+            self.resets += 1
+
+        def play_and_record(self, output, **options):
+            entered.set()
+            assert release.wait(3)
+            return super().play_and_record(output, **options)
+
+    hardware = Blocking(view.editor.setup().daq)
+    monkeypatch.setattr(gui, "make_hardware", lambda *a, **kw: hardware)
+    dialog = view.comparison_dialog
+    dialog.start_button.click()
+    try:
+        wait_until(app, entered.is_set)
+        output = view.job_output
+        assert not view.calibrate_button.isEnabled()
+        assert not view.mode.isEnabled()
+        assert dialog.stop_button.isEnabled()
+        assert not view.volume_fader.isEnabled()
+        view.language.setCurrentIndex(1)
+        assert "fixed gain" in view.status.text()
+        if close_main:
+            view.close()
+        else:
+            dialog.reject()  # Includes the Escape-key path.
+        assert view.worker.cancel_event.is_set()
+    finally:
+        release.set()
+    wait_until(app, lambda: view.worker is None)
+    assert hardware.resets == 2
+    assert not dialog.isVisible()
+    assert view.isVisible() is not close_main
+    row = read_json(output / "summary.json")["rows"][0]
+    assert row["status"] == "cancelled"
+    assert row["delta_db"] is None
+
+
+def test_calibration_history_opens_comparison_with_saved_settings(window, app):
+    view, _ = window
+    calibrate_comparison_source(view, app)
+    view.editor.fields["daq.sample_rate_hz"].setText("48000")
+    view.history.selectRow(0)
+    view._compare_history()
+    wait_until(app, lambda: view.worker is None)
+    assert view.editor.setup().daq.sample_rate_hz == 32000
+    assert view.comparison_dialog.isVisible()
+    assert view.comparison_dialog.start_button.isEnabled()
