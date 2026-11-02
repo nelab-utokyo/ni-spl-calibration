@@ -91,7 +91,7 @@ def test_gui_calibration_and_exact_replay_without_original_source(window, app, t
     view.source_location.setText(str(wav))
     target = 70.12345678901234
     view.target.setValue(target)
-    view.tabs.setCurrentIndex(2)
+    view.tabs.setCurrentIndex(gui.Page.CALIBRATION)
     assert view.calibrate_button.isEnabled()
     view.calibrate_button.click()
     wait_until(app, lambda: view.worker is None)
@@ -147,7 +147,7 @@ def test_monitor_updates_records_and_excludes_other_daq_operations(window, app):
     view, _ = window
     view.measure_button.click()
     wait_until(app, lambda: view.worker is None)
-    view.tabs.setCurrentIndex(4)
+    view.tabs.setCurrentIndex(gui.Page.SETUP)
     view.monitor_start.click()
     wait_until(app, lambda: view.monitor_duration_s >= 0.2)
     assert not view.measure_button.isEnabled()
@@ -163,7 +163,7 @@ def test_monitor_updates_records_and_excludes_other_daq_operations(window, app):
     assert view.monitor_samples is samples_before
     assert view.monitor_duration_s == duration_before
     assert view.worker is not None
-    assert view.monitor_status.text().startswith("Monitoring")
+    assert view.spectrum_state.text().startswith("Live")
     assert view.stop_button.text() == "Stop"
     view.language.setCurrentIndex(0)
     directory = view.job_output
@@ -173,7 +173,7 @@ def test_monitor_updates_records_and_excludes_other_daq_operations(window, app):
     assert read_json(directory / "summary.json")["captured_samples"] >= 6400
     assert not list(directory.glob("capture-*.npz"))
     assert read_json(directory / "monitor.json")["save_capture"] is False
-    assert "停止しました" in view.monitor_status.text()
+    assert "停止" in view.spectrum_state.text()
     events = [read_json(path) for path in view.activity.directory.glob("events/*.json")]
     assert any(
         item["action"] == "stop_requested" and item["operation"] == "monitor" for item in events
@@ -271,8 +271,7 @@ def test_startup_defaults_to_hardware_without_accessing_daq(app, tmp_path, monke
         assert view.mode.currentText() == "NI DAQ 実機"
         assert view.worker is None
         assert view.reference is None
-        assert not view.save_monitor.isChecked()
-        assert not view.save_playback.isChecked()
+        assert not view.save_capture.isChecked()
         assert view.editor.setup().measurement.max_upward_step_db == 10
         view.language.setCurrentIndex(1)
         assert view.mode.currentText() == "NI DAQ hardware"
@@ -298,12 +297,12 @@ def test_language_switch_preserves_inputs_and_prepared_waveform(window, app, tmp
     original_reference = view.reference
     info = view.stimulus_info.text()
     view.language.setCurrentIndex(1)
-    assert view.tabs.tabText(2) == "3  Waveform calibration"
-    assert view.measure_button.text() == "Measure and save reference"
+    assert view.tabs.tabText(gui.Page.PLAYBACK) == "3  Audio / starting level"
+    assert view.measure_button.text() == "Measure reference"
     assert view.calibrate_button.text() == "Start calibration"
-    assert view.reference_status.text().startswith("Ready:")
-    assert "Common sample rate: 32,000 Hz" in view.shared_rate.text()
-    assert "Capture: 2 s" in view.reference_instruction.text()
+    assert view.reference_status.text() == "Ready"
+    assert "Rate 32,000 Hz" in view.shared_rate.text()
+    assert "AI Dev1/ai0" in view.reference_instruction.text()
     assert view.editor.setup() == original_setup
     assert view.stimulus is original_stimulus
     assert view.reference is original_reference
@@ -320,7 +319,7 @@ def test_language_switch_preserves_inputs_and_prepared_waveform(window, app, tmp
     view.editor.fields["daq.sample_rate_hz"].setText("32000")
     view.language.setCurrentIndex(1)
     view.target.setValue(float("nan"))
-    assert view.calibration_hint.text() == "Check the target SPL."
+    assert view.calibration_hint.text() == "Check target SPL"
     assert not view.calibrate_button.isEnabled()
     view.target.setValue(70)
 
@@ -376,7 +375,7 @@ def test_test_playback_fader_stereo_monitor_mute_and_mid_file_stop(window, app, 
         subtype="DOUBLE",
     )
     view.source_location.setText(str(wav))
-    view.tabs.setCurrentIndex(5)
+    view.tabs.setCurrentIndex(gui.Page.PLAYBACK)
     assert view.reference is None
     assert view.playback_start.isEnabled()
     view.playback_start.click()
@@ -399,14 +398,14 @@ def test_test_playback_fader_stereo_monitor_mute_and_mid_file_stop(window, app, 
     assert view.monitor_rms.text() != "—"
     directory = view.job_output
     view.volume_fader.setValue(800)
-    wait_until(app, lambda: "80.0%" in view.playback_status.text())
+    wait_until(app, lambda: "80.0%" in view.status.text())
     view.language.setCurrentIndex(1)
-    assert view.playback_start.text() == "Start test playback"
+    assert view.playback_start.text() == "Test playback"
     assert view.volume_fader.isEnabled()
     view.mute_button.click()
     wait_until(app, lambda: view.playback_peak.text() == "0")
     view.volume_fader.setValue(500)
-    wait_until(app, lambda: "50.0%" in view.playback_status.text())
+    wait_until(app, lambda: "50.0%" in view.status.text())
     view.playback_stop.click()
     wait_until(app, lambda: view.worker is None)
     summary = read_json(directory / "summary.json")
@@ -445,20 +444,26 @@ def test_playback_volume_is_applied_to_the_first_calibration_output(
     view.measure_button.click()
     wait_until(app, lambda: view.worker is None)
     reference = view.reference
+    assert view.reference_next.isEnabled()
+    view.reference_next.click()
+    assert view.tabs.currentIndex() == gui.Page.PLAYBACK
     if windowed:
         rate = view.editor.setup().daq.sample_rate_hz
         samples = 0.8 * np.sin(2 * np.pi * 1000 * np.arange(rate) / rate)
         samples[rate // 4 : 3 * rate // 4] *= 0.25
         path = tmp_path / "varying-level.wav"
         sf.write(path, samples, rate, subtype="DOUBLE")
-        view.editor.fields["measurement.start_s"].setText("0.25")
-        view.editor.fields["measurement.stop_s"].setText("0.75")
         view.source_location.setText(str(path))
         view._prepare(playback_preview=True)
     else:
         view._choose_test_tone()
     wait_until(app, lambda: view.worker is None)
     stimulus = view.stimulus
+    if windowed:
+        view.editor.fields["measurement.start_s"].setText("0.25")
+        view.editor.fields["measurement.stop_s"].setText("0.75")
+        assert view.stimulus is stimulus
+        assert view.waveform.selection == (0.25, 0.75)
     view.playback_start.click()
     wait_until(app, lambda: view.adopt_start_button.isEnabled())
     view.volume_fader.setValue(150)
@@ -470,10 +475,10 @@ def test_playback_volume_is_applied_to_the_first_calibration_output(
     assert choice["peak_v"] == pytest.approx(0.075)
     initial_peak = 0.01875 if windowed else 0.075
     view.language.setCurrentIndex(1)
-    assert view.adopt_start_button.text() == "Use this volume to start calibration"
+    assert view.adopt_start_button.text() == "Use this level →"
     view.adopt_start_button.click()
     wait_until(app, lambda: view.worker is None)
-    assert view.tabs.currentIndex() == 2
+    assert view.tabs.currentIndex() == gui.Page.CALIBRATION
     assert view.stimulus is stimulus
     assert view.reference is reference
     assert view.editor.setup().measurement.start_scale_v == pytest.approx(choice["scale_v"])
