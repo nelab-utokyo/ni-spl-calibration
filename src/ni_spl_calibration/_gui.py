@@ -5,15 +5,26 @@ from __future__ import annotations
 import json
 import math
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
 from threading import Event
+from uuid import uuid4
 
 import numpy as np
 import yaml
-from PySide6.QtCore import QPointF, QRectF, QSignalBlocker, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import (
+    QItemSelectionModel,
+    QPointF,
+    QRectF,
+    QSignalBlocker,
+    Qt,
+    QThread,
+    QUrl,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -64,13 +75,13 @@ from .i18n import (
     set_value,
     translate,
 )
+from .jobs import CalibrationJob, load_plan, run_queue, save_plan, starting_context
 from .meter import LiveMeter
 from .monitor import monitor_input
 from .playback import VolumeControl, run_test_playback
 from .records import ActivityLog, file_sha256, find_runs, load_replay
 from .workflow import (
     StimulusSource,
-    calibrate_to_directory,
     make_hardware,
     measure_reference_to_file,
 )
@@ -793,6 +804,12 @@ class CalibrationWindow(QMainWindow):
         self._playback_start_choice = None
         self._pending_start_choice = None
         self._meter_band = None
+        self.jobs = []
+        self._active_job_id = None
+        self._switching_job = False
+        self._pause_after = Event()
+        self.last_plan = None
+        self._queue_setup = None
         content = QWidget()
         self.setCentralWidget(content)
         layout = QVBoxLayout(content)
@@ -913,6 +930,26 @@ class CalibrationWindow(QMainWindow):
         layout.addWidget(widgets[-1])
         self._page_layouts[self.tabs.count() - 1].addWidget(footer)
 
+    def _page_sidebar(self, page, sidebar):
+        outer = self._page_layouts[page]
+        area = self._scroll_areas[page]
+        outer.removeWidget(area)
+        body = QWidget()
+        split = QHBoxLayout(body)
+        split.setContentsMargins(16, 6, 0, 0)
+        split.setSpacing(0)
+        side_area = QScrollArea()
+        side_area.setFixedWidth(sidebar.width())
+        side_area.setWidgetResizable(True)
+        side_area.setFrameShape(QFrame.Shape.NoFrame)
+        side_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sidebar.setMinimumWidth(0)
+        sidebar.setMaximumWidth(16777215)
+        side_area.setWidget(sidebar)
+        split.addWidget(side_area)
+        split.addWidget(area, 1)
+        outer.insertWidget(0, body, 1)
+
     def _settings_tab(self):
         layout = self._page("1  設定")
         self.setup_path = label("新規セットアップ", muted=True)
@@ -966,6 +1003,39 @@ class CalibrationWindow(QMainWindow):
         )
         self.start_level_info = label("—", muted=True)
         layout.addWidget(self.start_level_info)
+        self.queue_table = self._job_table(
+            ["刺激", "目標 [dB SPL]", "状態", "実測 [dB SPL]", "電圧倍率 [V/デジタル値]"]
+        )
+        layout.addWidget(self.queue_table)
+        layout.removeWidget(self.queue_table)
+        layout.insertWidget(0, self.queue_table)
+        self.execution_scope = QComboBox()
+        self.execution_scope.setFixedWidth(160)
+        for text, value in [
+            ("未完了", "remaining"),
+            ("選択した刺激", "selected"),
+            ("すべて", "all"),
+        ]:
+            self.execution_scope.addItem(text, value)
+            bind(self.execution_scope, "setItemText", text, self.execution_scope.count() - 1)
+        self.execution_scope.currentIndexChanged.connect(self._refresh)
+        self.skip_button = button("スキップ", self._skip_jobs)
+        self.pause_after = QCheckBox()
+        set_text(self.pause_after, "この刺激の完了後に停止")
+        self.pause_after.toggled.connect(
+            lambda checked: self._pause_after.set() if checked else self._pause_after.clear()
+        )
+        self.queue_progress = label("", muted=True)
+        self.open_plan_button = button("一覧結果を開く", self._open_plan)
+        queue_tools = row(
+            self.execution_scope,
+            self.skip_button,
+            self.pause_after,
+            self.queue_progress,
+            self.open_plan_button,
+        )
+        queue_tools.layout().setContentsMargins(16, 6, 16, 4)
+        self._page_layouts[Page.CALIBRATION].insertWidget(0, queue_tools)
         target_card, self.calibration_target = metric("目標 [dB SPL]")
         level_card, self.level_value = metric("実測 [dB SPL]")
         scale_card, self.scale_value = metric("電圧倍率 [V/デジタル値]")
@@ -988,7 +1058,17 @@ class CalibrationWindow(QMainWindow):
         self.open_result_button = button("結果を開く", self._open_result)
         self.open_result_button.setEnabled(False)
         layout.addWidget(row(self.result_file, self.open_result_button))
-        layout.addWidget(disclosure("探索条件・初期倍率を直接指定", self.editor.blocks["search"]))
+        self.job_error = label("", muted=True)
+        self.job_error.setWordWrap(True)
+        self.job_error.hide()
+        layout.addWidget(self.job_error)
+        search = QWidget()
+        search_layout = QVBoxLayout(search)
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        search_layout.addWidget(self.editor.blocks["search"])
+        self.manual_start_button = button("指定した初期倍率を採用", self._adopt_manual_start)
+        search_layout.addWidget(self.manual_start_button, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(disclosure("探索条件・初期倍率を直接指定", search))
         self._page_actions(self.calibrate_button, self.calibration_hint)
 
     def _show_error(self, error):
@@ -1081,7 +1161,7 @@ class CalibrationWindow(QMainWindow):
         def task(cancelled, progress):
             if cancelled():
                 raise MeasurementCancelled("Measurement cancelled")
-            result = load_replay(path)
+            result = load_plan(path) if (Path(path) / "plan.json").is_file() else load_replay(path)
             if cancelled():
                 raise MeasurementCancelled("Measurement cancelled")
             return result
@@ -1201,8 +1281,51 @@ class CalibrationWindow(QMainWindow):
 
     def _playback_tab(self):
         layout = self._page("3  音声・開始音量", scroll=True)
+        self.stimulus_table = self._job_table(["刺激", "グループ", "目標", "音量"])
+        self.stimulus_table.horizontalHeaderItem(2).setToolTip("dB SPL")
+        bind(self.stimulus_table.horizontalHeaderItem(3), "setToolTip", "開始音量", scope=self)
+        layout.addWidget(self.stimulus_table)
+        self.group_name = QLineEdit()
+        self.group_name.setFixedWidth(120)
+        bind(self.group_name, "setPlaceholderText", "グループ（任意）")
+        self.add_sources_button = button("追加…", lambda: self._choose_sources(append=True))
+        self.remove_sources_button = button("削除", lambda: self._guard(self._remove_jobs))
+        self.duplicate_sources_button = button("複製", self._duplicate_jobs)
+        self.apply_target_button = button("目標を選択行に適用", self._apply_targets)
+        self.apply_group_button = button("グループを適用", self._apply_group)
+        self.save_plan_button = button("計画を保存", self._save_plan)
+        self.load_plan_button = button("計画を読み込む", self._choose_plan)
+        self.preparation_count = label("", muted=True)
+        queue_tools = row(
+            self.add_sources_button,
+            self.remove_sources_button,
+            self.duplicate_sources_button,
+            button("↑", lambda: self._guard(lambda: self._move_job(-1))),
+            button("↓", lambda: self._guard(lambda: self._move_job(1))),
+            self.save_plan_button,
+            self.load_plan_button,
+            self.preparation_count,
+        )
+        queue_tools.layout().setContentsMargins(16, 6, 16, 4)
+        sidebar = QWidget()
+        sidebar.setFixedWidth(345)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(4)
+        self.stimulus_table.setMaximumHeight(16777215)
+        self.stimulus_table.setMinimumHeight(70)
+        self.stimulus_table.hideColumn(1)  # Group is also shown alongside the name.
+        sidebar_layout.addWidget(self.stimulus_table, 1)
+        bulk = QWidget()
+        bulk_layout = QVBoxLayout(bulk)
+        bulk_layout.setContentsMargins(0, 0, 0, 0)
+        bulk_layout.addWidget(self.apply_target_button)
+        bulk_layout.addWidget(row(self.group_name, self.apply_group_button))
+        sidebar_layout.addWidget(disclosure("一括設定", bulk))
+        self._page_sidebar(Page.PLAYBACK, sidebar)
+        self._page_layouts[Page.PLAYBACK].insertWidget(0, queue_tools)
         self.source_kind = QComboBox()
-        self.source_kind.setFixedWidth(160)
+        self.source_kind.setFixedWidth(140)
         for index, source in enumerate(["WAVファイル", "保存波形 (NPZ)", "Python生成関数"]):
             self.source_kind.addItem(source)
             bind(self.source_kind, "setItemText", source, index)
@@ -1236,7 +1359,7 @@ class CalibrationWindow(QMainWindow):
             self.wav_channels.addItem(source, mode)
             bind(self.wav_channels, "setItemText", source, index)
         self.wav_channels.setCurrentIndex(1)
-        self.wav_channels.setMaximumWidth(210)
+        self.wav_channels.setMaximumWidth(170)
         self.preview_button = button("波形を確認", lambda: self._prepare(playback_preview=True))
         self.shared_rate = label("", muted=True)
         self.stimulus_info = label("音声未選択", muted=True)
@@ -1258,9 +1381,9 @@ class CalibrationWindow(QMainWindow):
             detail_layout.addWidget(widget)
         layout.addWidget(disclosure("波形情報・接続", details))
         layout.addWidget(disclosure("再生区間", self.editor.blocks["window"]))
-        levels = QGroupBox()
-        bind(levels, "setTitle", "開始音量")
+        levels = QFrame()
         level_layout = QHBoxLayout(levels)
+        level_layout.setContentsMargins(12, 6, 12, 6)
         target_panel = QWidget()
         target_layout = QVBoxLayout(target_panel)
         target_layout.setContentsMargins(0, 0, 12, 0)
@@ -1273,6 +1396,7 @@ class CalibrationWindow(QMainWindow):
         fader_panel = QWidget()
         fader_layout = QVBoxLayout(fader_panel)
         fader_layout.setContentsMargins(0, 0, 12, 0)
+        fader_layout.setSpacing(2)
         self.volume_text = label("")
         fader_layout.addWidget(self.volume_text)
         self.volume_fader = QSlider(Qt.Orientation.Horizontal)
@@ -1288,7 +1412,7 @@ class CalibrationWindow(QMainWindow):
         command, self.playback_peak = metric("出力 [Vpeak]")
         command.setFixedWidth(160)
         level_layout.addWidget(command)
-        levels.setFixedHeight(140)
+        levels.setFixedHeight(100)
         level_container = QWidget()
         level_container_layout = QVBoxLayout(level_container)
         level_container_layout.setContentsMargins(16, 0, 16, 4)
@@ -1314,6 +1438,423 @@ class CalibrationWindow(QMainWindow):
         )
         layout.addStretch()
         self._volume_changed()
+
+    def _job_table(self, columns):
+        table = QTableWidget(0, len(columns))
+        set_headers(table, columns)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.verticalHeader().hide()
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        table.setMinimumHeight(90)
+        table.setMaximumHeight(155)
+        table.currentCellChanged.connect(
+            lambda row, column, old_row, old_column: self._select_job_row(table, row)
+        )
+        table.itemSelectionChanged.connect(self._refresh)
+        return table
+
+    def _active_job(self):
+        return next((j for j in self.jobs if j.id == self._active_job_id), None)
+
+    def _selected_job_ids(self, table):
+        return {
+            table.item(index.row(), 0).data(Qt.ItemDataRole.UserRole)
+            for index in table.selectionModel().selectedRows()
+            if table.item(index.row(), 0) is not None
+        }
+
+    def _sync_active_job(self):
+        if self._switching_job or self.stimulus is None:
+            return self._active_job()
+        setup = self.editor.setup()
+        target = self.target.value()
+        source = asdict(self._source())
+        source["parameters"] = str(source["parameters"]) if source["parameters"] else None
+        job = self._active_job()
+        if job is None:
+            job = CalibrationJob(
+                Path(
+                    source["location"].rpartition(":")[0]
+                    if source["kind"] == "generator"
+                    else source["location"]
+                ).name,
+                self.stimulus,
+                setup.measurement,
+                target,
+                source=source,
+                parent_run=self._parent_run,
+            )
+            self.jobs.append(job)
+            self._active_job_id = job.id
+        else:
+            changed = (
+                job.stimulus is not self.stimulus
+                or job.measurement != setup.measurement
+                or job.target_spl_db != target
+            )
+            if job.stimulus is not self.stimulus or (
+                job.measurement.start_scale_v != setup.measurement.start_scale_v
+            ):
+                job.start_context = None
+                job.start_evidence = None
+            if changed:
+                job.status, job.result, job.error, job.iterations = "pending", None, None, []
+                job.output = None
+            if job.source != source:
+                location = (
+                    source["location"].rpartition(":")[0]
+                    if source["kind"] == "generator"
+                    else source["location"]
+                )
+                job.name = Path(location).name
+            job.stimulus, job.measurement, job.target_spl_db = (
+                self.stimulus,
+                setup.measurement,
+                target,
+            )
+            job.source = source
+            job.parent_run = self._parent_run
+        return job
+
+    def _select_job_row(self, table, row):
+        if self._switching_job or self.worker is not None or row < 0:
+            return
+        item = table.item(row, 0)
+        if item is not None:
+            job_id = item.data(Qt.ItemDataRole.UserRole)
+            if job_id != self._active_job_id:
+                self._guard(lambda: self._activate_job(job_id, selection_table=table))
+
+    def _activate_job(self, job_id, *, running=False, selection_table=None):
+        job = next(j for j in self.jobs if j.id == job_id)
+        if not running:
+            if (
+                self._active_job_id is not None
+                and self.stimulus is None
+                and self.source_location.text().strip()
+            ):
+                raise ValueError(translate(self, "先に波形を確認してください"))
+            self._sync_active_job()
+        setup = self._queue_setup if running else self.editor.setup()
+        self._switching_job = True
+        try:
+            self._active_job_id = job.id
+            self._parent_run = job.parent_run
+            self.editor.set_setup(replace(setup, measurement=job.measurement))
+            source = job.source
+            kind = source.get("kind", "npz")
+            self.source_kind.setCurrentIndex(["wav", "npz", "generator"].index(kind))
+            location = source.get("location", job.name)
+            if kind == "generator":
+                location, _, function = location.rpartition(":")
+                self.function_name.setText(function)
+            self.source_location.setText(location)
+            self.parameters_path.setText(source.get("parameters") or "")
+            self.wav_channels.setCurrentIndex(
+                max(0, self.wav_channels.findData(source.get("wav_channel_mode", "mono")))
+            )
+            self.generator_row.setVisible(kind == "generator")
+            self.parameters_row.setVisible(kind == "generator")
+            self.wav_channels.setVisible(kind == "wav")
+            self.target.setValue(job.target_spl_db)
+            self.level_meter.set_levels(None, job.target_spl_db)
+            set_text(self.monitor_level, "—")
+            self._playback_start_choice = None
+            self._pending_start_choice = None
+            fraction = (job.start_evidence or {}).get("volume_fraction", 0.1)
+            self.volume_fader.setValue(round(fraction * 1000))
+            self._clear_results()
+            self._show_stimulus(job.stimulus)
+            for table in (self.stimulus_table, self.queue_table):
+                row_number = self.jobs.index(job)
+                blocker = QSignalBlocker(table)
+                table.setCurrentCell(row_number, 0, QItemSelectionModel.SelectionFlag.NoUpdate)
+                if table is not selection_table or not table.selectionModel().hasSelection():
+                    table.selectRow(row_number)
+                table.scrollToItem(table.item(row_number, 0))
+                del blocker
+            self._display_job_result(job)
+        finally:
+            self._switching_job = False
+        self._refresh()
+
+    def _display_job_result(self, job):
+        self.iterations.setRowCount(0)
+        for iteration in job.iterations:
+            self._iteration(iteration)
+        if job.result:
+            set_value(self.level_value, f"{job.result['measured_spl_db']:.2f}")
+            set_value(self.scale_value, f"{job.result['scale_v']:.7g}")
+            set_value(self.peak_value, f"{job.result['output_peak_v']:.6g}")
+        if job.output and job.output.is_dir():
+            self.last_output = job.output
+            set_value(
+                self.result_file,
+                str(job.output / ("result.json" if job.result else "failure.json")),
+            )
+            self.open_result_button.setEnabled(True)
+        if job.error:
+            set_text(self.calibration_hint, "{error}", error=error_message(ValueError(job.error)))
+            self.calibration_hint.setToolTip(job.error)
+        self.job_error.setVisible(bool(job.error))
+        set_text(self.job_error, "{error}", error=error_message(ValueError(job.error or "")))
+
+    def _update_job_tables(self, setup):
+        if self._switching_job:
+            return
+        states = {
+            "pending": "待機",
+            "running": "実行中",
+            "complete": "成功",
+            "failed": "失敗",
+            "cancelled": "停止",
+            "skipped": "スキップ済み",
+        }
+        for table in (self.stimulus_table, self.queue_table):
+            selected = self._selected_job_ids(table)
+            blocker = QSignalBlocker(table)
+            table.setRowCount(len(self.jobs))
+            for index, job in enumerate(self.jobs):
+                ready = setup is not None and job.ready(setup, self.simulate)
+                if table is self.stimulus_table:
+                    values = [
+                        f"{job.group} / {job.name}" if job.group else job.name,
+                        job.group or "—",
+                        f"{job.target_spl_db:g}",
+                        "設定済み" if ready else "未設定",
+                    ]
+                else:
+                    values = [
+                        f"{job.group} / {job.name}" if job.group else job.name,
+                        f"{job.target_spl_db:g}",
+                        states[job.status],
+                        f"{job.result['measured_spl_db']:.2f}" if job.result else "—",
+                        f"{job.result['scale_v']:.7g}" if job.result else "—",
+                    ]
+                for column, value in enumerate(values):
+                    translated = column == (3 if table is self.stimulus_table else 2)
+                    cell = (
+                        set_cell(table, index, column, value)
+                        if translated
+                        else set_cell(table, index, column, "{value}", value=value)
+                    )
+                    cell.setData(Qt.ItemDataRole.UserRole, job.id)
+                    cell.setSelected(job.id in selected)
+                    if column == 0:
+                        cell.setToolTip(f"{job.group} / {job.name}" if job.group else job.name)
+                    if job.error:
+                        cell.setToolTip(job.error)
+                if job.id == self._active_job_id:
+                    table.setCurrentCell(index, 0, QItemSelectionModel.SelectionFlag.NoUpdate)
+            if not selected and self._active_job_id:
+                for index, job in enumerate(self.jobs):
+                    if job.id == self._active_job_id:
+                        table.selectRow(index)
+            del blocker
+
+    def _execution_ids(self):
+        scope = self.execution_scope.currentData()
+        if scope == "selected":
+            return self._selected_job_ids(self.queue_table)
+        if len(self.jobs) == 1 and self.jobs[0].status == "complete":
+            return {self.jobs[0].id}
+        return {
+            j.id for j in self.jobs if scope == "all" or j.status not in {"complete", "skipped"}
+        }
+
+    def _adopt_manual_start(self):
+        def adopt():
+            if self.stimulus is None:
+                raise ValueError(translate(self, "先に波形を確認してください"))
+            job = self._sync_active_job()
+            setup = self.editor.setup()
+            measurement_bounds(self.stimulus, setup)
+            job.start_context = starting_context(setup, self.simulate)
+            job.start_evidence = {"method": "manual", "scale_v": job.measurement.start_scale_v}
+            self._audit("start_level_selected", job_id=job.id, **job.start_evidence)
+            self._refresh()
+
+        self._guard(adopt)
+
+    def _apply_targets(self):
+        def apply():
+            self._sync_active_job()
+            value = self.target.value()
+            for job in self.jobs:
+                if (
+                    job.id in self._selected_job_ids(self.stimulus_table)
+                    and job.target_spl_db != value
+                ):
+                    job.target_spl_db = value
+                    job.status, job.result, job.output, job.iterations = "pending", None, None, []
+            self._refresh()
+
+        self._guard(apply)
+
+    def _apply_group(self):
+        for job in self.jobs:
+            if job.id in self._selected_job_ids(self.stimulus_table):
+                job.group = self.group_name.text().strip()
+        self._refresh()
+
+    def _move_job(self, delta):
+        self._sync_active_job()
+        job = self._active_job()
+        if job is None:
+            return
+        index = self.jobs.index(job)
+        destination = index + delta
+        if 0 <= destination < len(self.jobs):
+            self.jobs[index], self.jobs[destination] = self.jobs[destination], self.jobs[index]
+            self._refresh()
+
+    def _remove_jobs(self):
+        selected = self._selected_job_ids(self.stimulus_table)
+        self.jobs = [job for job in self.jobs if job.id not in selected]
+        if self._active_job_id in selected:
+            self._active_job_id = None
+            self._switching_job = True
+            self.source_location.clear()
+            self._invalidate_stimulus()
+            self._switching_job = False
+            if self.jobs:
+                self._activate_job(self.jobs[0].id)
+        self._refresh()
+
+    def _duplicate_jobs(self):
+        def duplicate():
+            self._sync_active_job()
+            selected = self._selected_job_ids(self.stimulus_table)
+            duplicates = [
+                replace(
+                    job,
+                    id=uuid4().hex,
+                    status="pending",
+                    result=None,
+                    output=None,
+                    error=None,
+                    iterations=[],
+                )
+                for job in self.jobs
+                if job.id in selected
+            ]
+            self.jobs.extend(duplicates)
+            self._refresh()
+            if duplicates:
+                self._activate_job(duplicates[0].id)
+
+        self._guard(duplicate)
+
+    def _skip_jobs(self):
+        for job in self.jobs:
+            if job.id in self._selected_job_ids(self.queue_table) and job.status != "complete":
+                job.status = "skipped"
+        self._guard(
+            lambda: self._audit(
+                "queue_skipped", job_ids=sorted(self._selected_job_ids(self.queue_table))
+            )
+        )
+        self._refresh()
+
+    def _choose_plan(self):
+        path = QFileDialog.getExistingDirectory(
+            self, translate(self, "計画のフォルダを選択"), self.output_root.text()
+        )
+        if path:
+            self._restore(path)
+
+    def _save_plan(self):
+        def save():
+            self._sync_active_job()
+            if self.stimulus is None:
+                raise ValueError(translate(self, "先に波形を確認してください"))
+            setup, reference, simulate = self.editor.setup(), self.reference, self.simulate
+            jobs = [replace(job) for job in self.jobs]
+            output, parent = self._output_path("plan"), self.last_plan
+            self._start(
+                "save_plan",
+                lambda cancelled, progress: save_plan(
+                    output,
+                    jobs,
+                    setup=setup,
+                    reference=reference,
+                    simulate=simulate,
+                    parent=parent,
+                    cancel_requested=cancelled,
+                ),
+            )
+
+        self._guard(save)
+
+    def _apply_plan(self, plan):
+        self._switching_job = True
+        try:
+            self.jobs = plan.jobs
+            self.execution_scope.setCurrentIndex(0)
+            self._active_job_id = None
+            self.editor.set_setup(plan.setup)
+            self.mode.setCurrentIndex(0 if plan.simulate else 1)
+            self.reference = plan.reference
+            if plan.reference:
+                self._set_reference(plan.reference, plan.directory / "reference.json")
+            else:
+                set_text(self.reference_file, "—")
+                for value in (self.sensitivity_value, self.frequency_value, self.stability_value):
+                    set_text(value, "—")
+            self.last_plan = plan.directory
+            self.stimulus = None
+        finally:
+            self._switching_job = False
+        self._update_job_tables(plan.setup)
+        selected = next(
+            (job for job in self.jobs if job.status not in {"complete", "skipped"}), self.jobs[0]
+        )
+        self._activate_job(selected.id)
+        self.tabs.setCurrentIndex(Page.CALIBRATION)
+        self._refresh()
+
+    def _choose_sources(self, *, append):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, translate(self, "音声を追加"), "", "Audio (*.wav *.npz)"
+        )
+        if paths:
+            self._import_sources(paths, append=append)
+
+    def _import_sources(self, paths, *, append=True):
+        def prepare():
+            self._sync_active_job()
+            setup, target = self.editor.setup(), self.target.value()
+            channel_mode = self.wav_channels.currentData()
+            self._import_append = append
+
+            def task(cancelled, progress):
+                jobs = []
+                for path in paths:
+                    if cancelled():
+                        raise MeasurementCancelled("Measurement cancelled")
+                    source = StimulusSource(
+                        "npz" if Path(path).suffix.lower() == ".npz" else "wav",
+                        str(path),
+                        wav_channel_mode=channel_mode,
+                    )
+                    stimulus = source.prepare(setup.daq.sample_rate_hz)
+                    jobs.append(
+                        CalibrationJob(
+                            Path(path).name,
+                            stimulus,
+                            setup.measurement,
+                            target,
+                            source=asdict(source),
+                        )
+                    )
+                return jobs
+
+            self._start("import_sources", task)
+
+        self._guard(prepare)
 
     def _volume_changed(self):
         fraction = self.volume_fader.value() / 1000
@@ -1386,9 +1927,19 @@ class CalibrationWindow(QMainWindow):
         blocker = QSignalBlocker(field)
         field.setText(repr(choice["scale_v"]))
         del blocker
+        job = self._sync_active_job()
+        if job is not None:
+            job.start_context = starting_context(self.editor.setup(), self.simulate)
+            job.start_evidence = dict(choice)
         self._clear_results()
         self._refresh()
-        self.tabs.setCurrentIndex(Page.CALIBRATION)
+        next_job = next(
+            (j for j in self.jobs if not j.ready(self.editor.setup(), self.simulate)), None
+        )
+        if next_job is not None and len(self.jobs) > 1:
+            self._activate_job(next_job.id)
+        else:
+            self.tabs.setCurrentIndex(Page.CALIBRATION)
         set_text(
             self.status,
             "開始音量を設定しました",
@@ -1496,6 +2047,9 @@ class CalibrationWindow(QMainWindow):
         )
 
     def _apply_replay(self, replay):
+        self.jobs = []
+        self._active_job_id = None
+        self.stimulus = None
         self.editor.set_setup(replay.setup)
         set_value(self.setup_path, str(replay.directory / "setup.json"))
         self.mode.setCurrentIndex(0 if replay.backend == "simulation" else 1)
@@ -1505,6 +2059,9 @@ class CalibrationWindow(QMainWindow):
         self._set_reference(replay.reference, replay.directory / "reference.json")
         self._show_stimulus(replay.stimulus)
         self._parent_run = replay.parent_record
+        job = self._sync_active_job()
+        job.start_context = starting_context(replay.setup, self.simulate)
+        job.start_evidence = {"method": "restored", "scale_v": job.measurement.start_scale_v}
         self.tabs.setCurrentIndex(Page.CALIBRATION)
         self._refresh()
         set_text(
@@ -1562,6 +2119,19 @@ class CalibrationWindow(QMainWindow):
                 "volume_fraction": self.volume_control.get(),
                 "loop": self.loop_audio.isChecked(),
                 "save_capture": self.save_capture.isChecked(),
+            },
+            "queue": {
+                "parent_plan": str(self.last_plan) if self.last_plan else None,
+                "jobs": [
+                    {
+                        "id": job.id,
+                        "name": job.name,
+                        "group": job.group,
+                        "target_spl_db": job.target_spl_db,
+                        "measurement": asdict(job.measurement),
+                    }
+                    for job in self.jobs
+                ],
             },
         }
 
@@ -1667,6 +2237,8 @@ class CalibrationWindow(QMainWindow):
 
     @Slot()
     def _mode_changed(self):
+        if self._switching_job:
+            return
         self._playback_start_choice = None
         self._clear_results()
         self._refresh()
@@ -1674,6 +2246,8 @@ class CalibrationWindow(QMainWindow):
     @Slot()
     def _setup_changed(self):
         self.editor.update_band_limit()
+        if self._switching_job:
+            return
         try:
             setup = self.editor.setup()
         except (ValueError, TypeError):
@@ -1706,6 +2280,8 @@ class CalibrationWindow(QMainWindow):
 
     @Slot()
     def _target_changed(self):
+        if self._switching_job:
+            return
         self._clear_results()
         try:
             self.level_meter.set_levels(
@@ -1717,6 +2293,8 @@ class CalibrationWindow(QMainWindow):
 
     @Slot()
     def _source_changed(self):
+        if self._switching_job:
+            return
         generator = self.source_kind.currentIndex() == 2
         self.generator_row.setVisible(generator)
         self.parameters_row.setVisible(generator)
@@ -1731,6 +2309,7 @@ class CalibrationWindow(QMainWindow):
         set_text(self.result_file, "—")
         self.last_output = None
         self.open_result_button.setEnabled(False)
+        self.job_error.hide()
 
     def _invalidate_stimulus(self):
         self.stimulus = None
@@ -1743,13 +2322,20 @@ class CalibrationWindow(QMainWindow):
         set_text(self.playback_file_info, "音声未選択")
 
     def _refresh(self):
+        if self._switching_job:
+            return
         self._update_adopt_button()
+        if hasattr(self, "jobs") and len(self.jobs) > 1:
+            set_text(self.adopt_start_button, "この開始音量を採用")
+        else:
+            set_text(self.adopt_start_button, "この音量で校正へ →")
         self._update_start_level_info()
         if self.worker is not None:
             return
         try:
             setup = self.editor.setup()
         except (ValueError, TypeError) as error:
+            self._update_job_tables(None)
             set_text(
                 self.shared_rate, "設定を確認してください: {error}", error=error_message(error)
             )
@@ -1761,6 +2347,8 @@ class CalibrationWindow(QMainWindow):
             self.playback_start.setEnabled(False)
             self.setup_next.setEnabled(False)
             self.reference_next.setEnabled(False)
+            self.save_plan_button.setEnabled(False)
+            self.manual_start_button.setEnabled(False)
             return
         self.setup_next.setEnabled(True)
         self.monitor_spectrum.nyquist = setup.daq.sample_rate_hz / 2
@@ -1830,9 +2418,72 @@ class CalibrationWindow(QMainWindow):
         )
         self.open_result_button.setEnabled(self.last_output is not None)
         self.open_monitor_button.setEnabled(self.last_monitor_output is not None)
+        try:
+            self._sync_active_job()
+        except (ValueError, TypeError):
+            pass
+        for job in self.jobs:
+            if job.result and not job.ready(setup, self.simulate):
+                job.status, job.result, job.output, job.error, job.iterations = (
+                    "pending",
+                    None,
+                    None,
+                    None,
+                    [],
+                )
+        self._update_job_tables(setup)
+        set_text(
+            self.preparation_count,
+            "準備 {ready} / {count}",
+            ready=sum(j.ready(setup, self.simulate) for j in self.jobs),
+            count=len(self.jobs),
+        )
+        set_text(
+            self.queue_progress,
+            "{done} / {total}件完了",
+            done=sum(j.status == "complete" for j in self.jobs),
+            total=len(self.jobs),
+        )
+        ids = self._execution_ids()
+        ready = all(j.ready(setup, self.simulate) for j in self.jobs if j.id in ids)
+        self.save_plan_button.setEnabled(
+            bool(self.jobs) and self.stimulus is not None and valid_target
+        )
+        self.manual_start_button.setEnabled(self.stimulus is not None and valid_target)
+        self.remove_sources_button.setEnabled(bool(self.jobs))
+        self.skip_button.setEnabled(bool(self._selected_job_ids(self.queue_table)))
+        self.pause_after.setEnabled(False)
+        self.open_plan_button.setEnabled(self.last_plan is not None)
+        for control in (
+            self.execution_scope,
+            self.skip_button,
+            self.pause_after,
+            self.queue_progress,
+        ):
+            control.setVisible(len(self.jobs) > 1)
+        if len(self.jobs) > 1:
+            self.calibrate_button.setEnabled(
+                valid and bool(ids) and ready and valid_target and self.stimulus is not None
+            )
+            set_text(self.calibrate_button, "{count}件を開始", count=len(ids))
+            set_text(
+                self.calibration_hint,
+                "開始音量が未設定の刺激があります"
+                if not ready
+                else "準備完了"
+                if ids
+                else "実行する刺激を選択してください",
+            )
+        else:
+            set_text(self.calibrate_button, "校正を開始")
+            if self.jobs and not ids:
+                self.calibrate_button.setEnabled(False)
 
     def _choose_source(self):
         index = self.source_kind.currentIndex()
+        if index != 2:
+            self._choose_sources(append=False)
+            return
         filters = ["WAV (*.wav)", "保存波形 (*.npz)", "Python (*.py)"]
         path, _ = QFileDialog.getOpenFileName(
             self, translate(self, "波形・生成関数を選択"), "", translate(self, filters[index])
@@ -1937,6 +2588,8 @@ class CalibrationWindow(QMainWindow):
                 rms=info["digital_rms"],
                 peak=info["digital_peak"],
             )
+        if not self._switching_job:
+            self._sync_active_job()
         self._update_start_level_info()
         self._refresh()
 
@@ -2056,36 +2709,48 @@ class CalibrationWindow(QMainWindow):
                 raise ValueError(translate(self, "先にマイク基準を測定・読み込みしてください。"))
             validate_reference(setup, self.reference)
             self._check_backend(self.reference)
-            measurement_bounds(self.stimulus, setup)
-            output = self._output_path("calibration")
+            job = self._sync_active_job()
+            # Preserve direct single-stimulus use with explicitly configured search
+            # settings. A queue requires a checked starting level for every item.
+            if len(self.jobs) == 1 and not job.ready(setup, self.simulate):
+                measurement_bounds(job.stimulus, setup)
+                job.start_context = starting_context(setup, self.simulate)
+                job.start_evidence = {
+                    "method": "configured",
+                    "scale_v": job.measurement.start_scale_v,
+                }
+            selected_ids = self._execution_ids()
+            if not selected_ids:
+                raise ValueError(translate(self, "実行する刺激を選択してください"))
+            if any(not j.ready(setup, self.simulate) for j in self.jobs if j.id in selected_ids):
+                raise ValueError(translate(self, "開始音量が未設定の刺激があります"))
+            output = self._output_path("batch")
             if not self._confirm_hardware(setup):
                 return
-            stimulus, reference = self.stimulus, self.reference
-            target, simulate = self.target.value(), self.simulate
-            parent_run = self._parent_run
+            reference, simulate = self.reference, self.simulate
+            jobs, parent = [replace(j) for j in self.jobs], self.last_plan
             self._clear_results()
             self.job_output = output
+            self._queue_setup = setup
+            self._pause_after.clear()
+            self.pause_after.setChecked(False)
 
             def task(cancelled, progress):
-                if cancelled():
-                    raise MeasurementCancelled("Measurement cancelled")
-                hardware = make_hardware(setup, simulate=simulate)
-                meter = LiveMeter(setup, reference, progress)
-                return calibrate_to_directory(
-                    stimulus,
+                return run_queue(
+                    output,
+                    jobs,
+                    selected_ids=selected_ids,
                     setup=setup,
                     reference=reference,
-                    target_spl_db=target,
-                    output=output,
-                    hardware=hardware,
-                    on_iteration=progress,
-                    on_phase=progress,
+                    simulate=simulate,
+                    parent=parent,
+                    on_progress=progress,
                     cancel_requested=cancelled,
-                    parent_run=parent_run,
-                    on_samples=meter.push,
+                    pause_after=self._pause_after.is_set,
+                    hardware_factory=make_hardware,
                 )
 
-            self._start("calibrate", task, max_iterations=setup.measurement.max_iterations)
+            self._start("queue", task, max_iterations=setup.measurement.max_iterations)
 
         self._guard(search)
 
@@ -2099,6 +2764,9 @@ class CalibrationWindow(QMainWindow):
         self.volume_fader.setEnabled(not busy or playing)
         self.mute_button.setEnabled(not busy or playing)
         self.playback_stop.setEnabled(playing)
+        self.stimulus_table.setEnabled(not busy)
+        self.queue_table.setEnabled(not busy)
+        self.pause_after.setEnabled(busy and self.job_kind == "queue")
         monitoring = busy and self.job_kind == "monitor"
         self.monitor_start.setEnabled(not busy or monitoring)
         set_text(self.monitor_start, "停止" if monitoring else "マイク確認")
@@ -2115,11 +2783,11 @@ class CalibrationWindow(QMainWindow):
             operation=kind,
             context=self._context(),
             output=str(self.job_output)
-            if kind in {"reference", "calibrate", "monitor", "test_playback"}
+            if kind in {"reference", "calibrate", "queue", "monitor", "test_playback"}
             else None,
         )
         self.job_kind = kind
-        if kind in {"reference", "calibrate", "monitor", "test_playback"}:
+        if kind in {"reference", "calibrate", "queue", "monitor", "test_playback"}:
             self.monitor_samples = np.empty(0)
             self.monitor_duration_s = 0
             self.monitor_spectrum.clear()
@@ -2143,6 +2811,9 @@ class CalibrationWindow(QMainWindow):
                 "prepare_test_preview": "テスト再生用の音声を準備しています…",
                 "reference": "マイク基準を測定しています…",
                 "calibrate": "校正中…",
+                "queue": "条件を保存中…",
+                "save_plan": "条件を保存中…",
+                "import_sources": "波形を準備しています…",
                 "restore": "実行記録を照合して、条件を復元しています…",
                 "monitor": "マイク確認中",
                 "test_playback": "テスト再生中",
@@ -2152,6 +2823,29 @@ class CalibrationWindow(QMainWindow):
 
     @Slot(dict)
     def _iteration(self, item):
+        if item.get("kind") == "queue_job":
+            self.job_output = Path(item["output"])
+            job = next(j for j in self.jobs if j.id == item["job_id"])
+            job.status, job.result, job.iterations = "running", None, []
+            job.output, job.error = self.job_output, None
+            self._activate_job(job.id, running=True)
+            self._update_job_tables(self._queue_setup)
+            self.progress.setRange(0, job.measurement.max_iterations)
+            self.progress.setValue(0)
+            set_text(
+                self.queue_progress, "{index} / {total}件", index=item["index"], total=item["total"]
+            )
+            set_value(self.calibration_source, job.name)
+            set_value(self.calibration_target, f"{job.target_spl_db:g}")
+            self.monitor_samples = np.empty(0)
+            self.monitor_spectrum.clear()
+            return
+        if item.get("kind") == "queue_outcome":
+            job = next(j for j in self.jobs if j.id == item["job_id"])
+            job.status, job.result, job.error = item["status"], item["result"], item["error"]
+            job.output = Path(item["output"])
+            self._update_job_tables(self._queue_setup)
+            return
         if item.get("kind") == "hardware":
             self._hardware_info(item["description"])
             return
@@ -2186,6 +2880,20 @@ class CalibrationWindow(QMainWindow):
             self._monitor_frame(item)
             return
         number = self.iterations.rowCount()
+        if self.worker is not None and self.job_kind == "queue":
+            job = self._active_job()
+            job.iterations.append({k: v for k, v in item.items() if k != "job_id"})
+            row_number = self.jobs.index(job)
+            set_cell(
+                self.queue_table,
+                row_number,
+                3,
+                "SNR不足" if item["measured_spl_db"] is None else "{value}",
+                value=f"{item['measured_spl_db']:.2f}"
+                if item["measured_spl_db"] is not None
+                else "—",
+            )
+            set_cell(self.queue_table, row_number, 4, "{value}", value=f"{item['scale_v']:.7g}")
         self.iterations.insertRow(number)
         level = item["measured_spl_db"]
         error = item["error_db"]
@@ -2229,7 +2937,7 @@ class CalibrationWindow(QMainWindow):
         self.progress.setRange(0, 1)
         self.progress.setValue(0 if error else 1)
         self._set_busy(False)
-        if kind in {"reference", "calibrate", "monitor", "test_playback"}:
+        if kind in {"reference", "calibrate", "queue", "monitor", "test_playback"}:
             set_text(
                 self.spectrum_state,
                 "停止 · 最終入力" if self.monitor_spectrum.spectrum is not None else "待機中",
@@ -2247,11 +2955,26 @@ class CalibrationWindow(QMainWindow):
                 extra = {"stimulus": result.describe(), "saved_waveform": str(path)}
             elif error is None and kind == "reference":
                 extra = {"reference": asdict(result)}
-            elif error is None and kind == "restore":
+            elif error is None and kind == "import_sources":
                 extra = {
-                    "restored_from": result.parent_record,
-                    "stimulus_sha256": result.stimulus.sha256,
+                    "stimuli": [
+                        {
+                            "job_id": job.id,
+                            "source": job.source,
+                            "saved_waveform": str(self.activity.save_waveform(job.stimulus)),
+                        }
+                        for job in result
+                    ]
                 }
+            elif error is None and kind == "restore":
+                extra = (
+                    {"plan": str(result.directory), "job_ids": [job.id for job in result.jobs]}
+                    if hasattr(result, "jobs")
+                    else {
+                        "restored_from": result.parent_record,
+                        "stimulus_sha256": result.stimulus.sha256,
+                    }
+                )
             self._audit(
                 "operation_finished",
                 operation=kind,
@@ -2259,16 +2982,75 @@ class CalibrationWindow(QMainWindow):
                 if isinstance(error, MeasurementCancelled)
                 else "failed"
                 if error
+                else "held"
+                if kind == "queue" and result["status"] == "held"
                 else "complete",
-                error=str(error) if error else None,
-                output=str(self.job_output)
-                if kind in {"reference", "calibrate", "monitor", "test_playback"}
+                error=str(error) if error else result["error"] if kind == "queue" else None,
+                output=str(result["directory"])
+                if kind == "queue" and result is not None
+                else str(self.job_output)
+                if kind in {"reference", "calibrate", "queue", "monitor", "test_playback"}
                 else None,
                 notes=getattr(error, "__notes__", []) if error else [],
                 **extra,
             )
         except Exception as log_error:
             self._show_error(log_error)
+            if self._closing:
+                self.close()
+            return
+        if kind == "queue":
+            if result is not None:
+                self.jobs = result["jobs"]
+                self.last_plan = result["directory"]
+                self._queue_setup = None
+                self._activate_job(self._active_job_id or self.jobs[0].id)
+                set_text(
+                    self.status,
+                    "キューを保留しました"
+                    if result["status"] == "held"
+                    else "校正完了 · 結果を保存しました",
+                )
+                if result["error"]:
+                    set_text(
+                        self.status,
+                        "キューを保留しました: {error}",
+                        error=error_message(ValueError(result["error"])),
+                    )
+            else:
+                self._queue_setup = None
+                set_text(
+                    self.status,
+                    "停止しました。"
+                    if isinstance(error, MeasurementCancelled)
+                    else "エラー: {details}",
+                    details=error_message(error),
+                )
+                if not isinstance(error, MeasurementCancelled) and not self._closing:
+                    self._show_error(error)
+            self._refresh()
+            self._scan_history()
+            if self._closing:
+                self.close()
+            return
+        if error is None and kind == "save_plan":
+            self.last_plan = result
+            set_text(self.status, "計画を保存しました: {path}", path=result)
+            self._scan_history()
+            if self._closing:
+                self.close()
+            return
+        if error is None and kind == "import_sources":
+            old = self._active_job()
+            if not self._import_append and old is not None:
+                index = self.jobs.index(old)
+                self.jobs[index : index + 1] = result
+            else:
+                self.jobs.extend(result)
+            self._active_job_id, self.stimulus = None, None
+            self._update_job_tables(self.editor.setup())
+            self._activate_job(result[0].id)
+            set_text(self.status, "音声を準備しました")
             if self._closing:
                 self.close()
             return
@@ -2297,7 +3079,10 @@ class CalibrationWindow(QMainWindow):
             self._set_reference(result, self.job_output)
             set_text(self.status, "基準を保存しました")
         elif kind == "restore":
-            self._apply_replay(result)
+            if hasattr(result, "jobs"):
+                self._apply_plan(result)
+            else:
+                self._apply_replay(result)
         elif kind == "monitor":
             set_text(self.status, "モニター記録を保存しました")
         elif kind == "test_playback":
@@ -2351,13 +3136,17 @@ class CalibrationWindow(QMainWindow):
             set_text(
                 self.status,
                 "停止要求済み：短い取得単位で中断し、AOを0 Vへ戻します。"
-                if self.job_kind in {"reference", "calibrate", "monitor", "test_playback"}
+                if self.job_kind in {"reference", "calibrate", "queue", "monitor", "test_playback"}
                 else "停止要求済み：波形準備の完了後に終了します。",
             )
 
     def _open_result(self):
         if self.last_output is not None:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_output)))
+
+    def _open_plan(self):
+        if self.last_plan is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_plan)))
 
     def _open_monitor(self):
         if self.last_monitor_output is not None:

@@ -566,3 +566,190 @@ def test_playback_volume_is_applied_to_the_first_calibration_output(
     assert result["setup"]["measurement"]["start_scale_v"] == choice["scale_v"]
     view.source_location.setText("a-different-waveform.wav")
     assert not view.adopt_start_button.isEnabled()
+
+
+def test_multiple_stimuli_prepare_save_restore_run_and_rerun_selected(window, app, tmp_path):
+    view, _ = window
+    view.measure_button.click()
+    wait_until(app, lambda: view.worker is None)
+    files = []
+    for index, amplitude in enumerate([0.3, 0.7]):
+        path = tmp_path / f"sound-{index}.wav"
+        sf.write(
+            path,
+            amplitude * np.sin(2 * np.pi * (1000 + index * 1000) * np.arange(8820) / 44100),
+            44100,
+        )
+        files.append(path)
+    view.tabs.setCurrentIndex(gui.Page.PLAYBACK)
+    view._import_sources(files)
+    wait_until(app, lambda: view.worker is None)
+    assert len(view.jobs) == 2
+    assert view.stimulus_table.rowCount() == view.queue_table.rowCount() == 2
+    assert not view.calibrate_button.isEnabled()
+    hashes = [job.stimulus.sha256 for job in view.jobs]
+    scales = []
+    for index in range(2):
+        assert view._active_job_id == view.jobs[index].id
+        view.target.setValue(65 + index * 5)
+        view.volume_fader.setValue(100 + index * 50)
+        view.playback_start.click()
+        wait_until(app, lambda: view.adopt_start_button.isEnabled())
+        scales.append(view._playback_start_choice["scale_v"])
+        assert view.adopt_start_button.text() == "この開始音量を採用"
+        view.adopt_start_button.click()
+        wait_until(app, lambda: view.worker is None)
+        assert view.tabs.currentIndex() == (
+            gui.Page.PLAYBACK if index == 0 else gui.Page.CALIBRATION
+        )
+    assert [j.measurement.start_scale_v for j in view.jobs] == pytest.approx(scales)
+    assert view.calibrate_button.isEnabled()
+    view._save_plan()
+    wait_until(app, lambda: view.worker is None)
+    saved = view.last_plan
+    for path in files:
+        path.unlink()
+    view._restore(saved)
+    wait_until(app, lambda: view.worker is None)
+    assert [j.stimulus.sha256 for j in view.jobs] == hashes
+    view.language.setCurrentIndex(1)
+    assert view.calibrate_button.text() == "Start 2 jobs"
+    assert view.stimulus_table.item(0, 3).text() == "Checked"
+    view.calibrate_button.click()
+    wait_until(app, lambda: view.worker is None)
+    assert [j.status for j in view.jobs] == ["complete", "complete"]
+    assert [j.result["target_spl_db"] for j in view.jobs] == [65, 70]
+    assert [j.result["setup"]["measurement"]["start_scale_v"] for j in view.jobs] == pytest.approx(
+        scales
+    )
+    first_outputs = [j.output for j in view.jobs]
+    contents = [p.joinpath("result.json").read_bytes() for p in first_outputs]
+    batch = view.last_plan
+    assert (batch / "results.csv").is_file()
+    assert not list(batch.rglob("capture-*.npz"))
+    assert not view.calibrate_button.isEnabled()  # No unfinished jobs.
+    view.queue_table.selectRow(0)
+    assert view.level_value.text() == f"{view.jobs[0].result['measured_spl_db']:.2f}"
+    view.execution_scope.setCurrentIndex(1)
+    view.calibrate_button.click()
+    wait_until(app, lambda: view.worker is None)
+    assert view.jobs[0].output != first_outputs[0]
+    assert view.jobs[1].output == first_outputs[1]
+    assert [p.joinpath("result.json").read_bytes() for p in first_outputs] == contents
+
+
+def test_queue_bulk_target_group_duplicate_order_and_parameter_isolation(window, app, tmp_path):
+    view, _ = window
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"tone-{index}.wav"
+        sf.write(path, 0.4 * np.sin(2 * np.pi * 1000 * np.arange(6400) / 32000), 32000)
+        paths.append(path)
+    view._import_sources(paths)
+    wait_until(app, lambda: view.worker is None)
+    view.editor.fields["measurement.start_s"].setText("0.03")
+    view._adopt_manual_start()
+    view._activate_job(view.jobs[1].id)
+    assert view.editor.setup().measurement.start_s == 0
+    view._adopt_manual_start()
+    view.stimulus_table.setRangeSelected(widgets.QTableWidgetSelectionRange(0, 0, 1, 3), True)
+    view.target.setValue(62.5)
+    view._apply_targets()
+    assert [j.target_spl_db for j in view.jobs] == [62.5, 62.5]
+    view.group_name.setText("music")
+    view._apply_group()
+    assert [j.group for j in view.jobs] == ["music", "music"]
+    view.stimulus_table.selectRow(0)
+    view._duplicate_jobs()
+    assert len(view.jobs) == 3
+    duplicate = view._active_job()
+    assert duplicate.id != view.jobs[0].id
+    assert duplicate.stimulus is view.jobs[0].stimulus
+    assert duplicate.ready(view.editor.setup(), True)
+    view.target.setValue(80)
+    assert view.jobs[0].target_spl_db == 62.5
+    view._move_job(-1)
+    assert view.jobs[1].id == duplicate.id
+    view.editor.fields["daq.max_peak_v"].setText("0.3")
+    assert not any(j.ready(view.editor.setup(), True) for j in view.jobs)
+    view.stimulus_table.selectRow(1)
+    view._remove_jobs()
+    assert len(view.jobs) == 2
+
+
+@pytest.mark.parametrize("immediate", [True, False])
+def test_gui_queue_stop_and_resume(window, app, tmp_path, monkeypatch, immediate):
+    view, _ = window
+    entered, release = Event(), Event()
+    view.measure_button.click()
+    wait_until(app, lambda: view.worker is None)
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"tone-{index}.wav"
+        sf.write(path, 0.4 * np.sin(2 * np.pi * 1000 * np.arange(6400) / 32000), 32000)
+        paths.append(path)
+    view._import_sources(paths)
+    wait_until(app, lambda: view.worker is None)
+    for job in view.jobs:
+        view._activate_job(job.id)
+        view._adopt_manual_start()
+    factory = gui.make_hardware
+
+    class BlockingHardware(SimulatedHardware):
+        def play_and_record(self, output, **options):
+            entered.set()
+            assert release.wait(3)
+            return super().play_and_record(output, **options)
+
+    monkeypatch.setattr(gui, "make_hardware", lambda current, **kw: BlockingHardware(current.daq))
+    view.calibrate_button.click()
+    try:
+        wait_until(app, entered.is_set)
+        assert not view.stimulus_table.isEnabled()
+        assert view.pause_after.isEnabled()
+        if immediate:
+            view.stop_button.click()
+        else:
+            view.pause_after.setChecked(True)
+    finally:
+        release.set()
+    wait_until(app, lambda: view.worker is None)
+    assert [j.status for j in view.jobs] == ["cancelled" if immediate else "complete", "pending"]
+    previous = view.last_plan
+    monkeypatch.setattr(gui, "make_hardware", factory)
+    view.execution_scope.setCurrentIndex(1)
+    view._restore(previous)
+    wait_until(app, lambda: view.worker is None)
+    assert view.execution_scope.currentData() == "remaining"
+    view.calibrate_button.click()
+    wait_until(app, lambda: view.worker is None)
+    assert [j.status for j in view.jobs] == ["complete", "complete"]
+    assert view.last_plan != previous
+    events = [read_json(path) for path in view.activity.directory.glob("events/*.json")]
+    assert any(
+        event["action"] == "operation_finished"
+        and event.get("operation") == "queue"
+        and event["status"] == "held"
+        for event in events
+    )
+
+
+def test_single_stimulus_can_be_recalibrated_without_changing_execution_scope(window, app):
+    view, _ = window
+    view._choose_test_tone()
+    wait_until(app, lambda: view.worker is None)
+    view._measure_reference()
+    wait_until(app, lambda: view.worker is None)
+    view.calibrate_button.click()
+    wait_until(app, lambda: view.worker is None)
+    first = view.last_output
+    assert view.execution_scope.currentData() == "remaining"
+    assert view.calibrate_button.isEnabled()
+    view.calibrate_button.click()
+    wait_until(app, lambda: view.worker is None)
+    assert view.last_output != first
+    assert (first / "result.json").is_file()
+    view.editor.fields["daq.max_peak_v"].setText("0.3")
+    assert view.jobs[0].result is None
+    assert view.jobs[0].status == "pending"
+    assert not view.jobs[0].ready(view.editor.setup(), True)

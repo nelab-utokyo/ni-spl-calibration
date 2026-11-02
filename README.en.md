@@ -25,7 +25,7 @@ Load `stimulus.npz` and `result.json` from a successful calibration record in yo
 from pathlib import Path
 from ni_spl_calibration import apply_calibration, load_result, load_stimulus
 
-folder = Path("results/calibration-timestamp")  # Use the actual record folder
+folder = Path("results/batch-timestamp/runs/attempt-ID")  # Use the actual record folder
 stimulus = load_stimulus(folder / "stimulus.npz")
 result = load_result(folder / "result.json")
 
@@ -55,6 +55,10 @@ Calibration records preserve the digital inputs for reuse without the original W
 Input checks and test playback log voltage, SPL and spectra in `levels.jsonl`; test playback also records applied volume. When raw recording is enabled, `capture-*.npz` contains microphone input and, during test playback, output voltage. GUI activity is stored under `sessions/<session ID>/events/`.
 
 Reusing digital inputs does not reproduce the physical sound field. Check equipment, gain and microphone geometry when repeating a measurement.
+
+Calibration queues are saved under `batch-timestamp/`. `plan.json` and `waveforms/` preserve the order, per-stimulus targets, initial scales, settings and frozen samples; `plan-checksums.json` verifies their integrity. `summary.json` / `results.csv` contain the overall results. `runs/<attempt-ID>/` contains this execution's calibration bundles, and `prior-runs/<stimulus-ID>/` contains retained earlier bundles. Pass the `stimulus.npz` and `result.json` from a successful row's `output` folder to your experiment program. Relative `output` paths start at the queue's record folder.
+
+Errors and stops hold the remaining queue. Interrupted stimuli restart with a new background measurement. Restoring a plan never starts audio; resuming or rerunning creates a new output directory. Plans saved without execution use `plan-timestamp/`. Restoration does not require the original WAV or generator, but physical remeasurement requires the same equipment and acoustic path and a valid microphone reference.
 
 ## Further reference
 

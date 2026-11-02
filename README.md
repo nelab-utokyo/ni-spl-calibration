@@ -25,7 +25,7 @@ uv run ni-spl
 from pathlib import Path
 from ni_spl_calibration import apply_calibration, load_result, load_stimulus
 
-folder = Path("results/calibration-実行日時")  # 実際の記録フォルダに変更
+folder = Path("results/batch-実行日時/runs/実行ID")  # 実際の記録フォルダに変更
 stimulus = load_stimulus(folder / "stimulus.npz")
 result = load_result(folder / "result.json")
 
@@ -55,6 +55,10 @@ output_channel = result.setup["daq"]["output_channel"]
 マイク確認・テスト再生では `levels.jsonl` に電圧・音圧・スペクトラムを記録し、テスト再生の適用音量も残します。生入力の記録を有効にした場合は `capture-*.npz` に入力波形、テスト再生時は出力電圧も保存します。GUIの操作履歴は `sessions/<セッションID>/events/` に保存します。
 
 保存波形や設定の再利用は、物理的な音場まで再現するものではありません。再測定時も機器・ゲイン・マイク位置を確認してください。
+
+校正キューの記録は `batch-実行日時/` に保存します。`plan.json` と `waveforms/` が順番・刺激ごとの目標音圧・開始倍率・条件・固定波形を保持し、`plan-checksums.json` で整合性を確認します。`summary.json` / `results.csv` が全体の結果、`runs/<実行ID>/` が今回の校正記録、`prior-runs/<刺激ID>/` が引き継いだ記録です。実験プログラムには、成功した行の `output` が指すフォルダ内の `stimulus.npz` と `result.json` を渡します。`output` の相対パスは、このキューの記録フォルダが基準です。
+
+キューはエラー・停止時に残りを保留し、中断された刺激は背景測定から再実行します。計画の復元では音を出さず、再開・再実行は新しい保存先を作ります。計画だけの保存先は `plan-実行日時/` です。元のWAVや生成コードがなくても復元できますが、実機での再測定には同じ機器・音響経路と有効なマイク基準が必要です。
 
 ## 詳細資料
 
