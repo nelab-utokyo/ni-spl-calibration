@@ -12,6 +12,18 @@ from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
 
 ENGLISH = {
+    "音圧計算帯域": "SPL band",
+    "暗い部分は音圧計算の対象外です。スペクトラムは入力電圧を表示します。": "Dimmed regions are excluded from SPL. The spectrum shows input voltage.",
+    "指定": "Custom",
+    "再生区間": "Playback interval",
+    "音圧帯域の下限 [Hz]": "SPL band lower limit [Hz]",
+    "音圧帯域の上限 [Hz]": "SPL band upper limit [Hz]",
+    "校正・テスト再生・マイク確認のSPLに共通。DCは除外し、A/C特性は適用しません。再生波形は変わりません。": "Shared by calibration, test playback and input monitoring. DC is excluded; no A/C weighting. Playback audio is unchanged.",
+    "帯域にはHz単位の数値を入力してください": "Enter band limits in Hz",
+    "帯域は 0 ≤ 下限 < 上限 で指定してください": "Band must satisfy 0 ≤ lower < upper",
+    "サンプルレートを確認してください": "Check the sample rate",
+    "上限は {limit:g} Hz以下": "Upper limit must be ≤ {limit:g} Hz",
+    "上限 {limit:g} Hz · A/C補正なし": "Max {limit:g} Hz · No A/C weighting",
     "総音圧（背景音を含む）と目標音圧": "Total SPL including background, compared with the target",
     "目標 {value:g}": "Target {value:g}",
     "マイク確認・テスト再生の生入力を保存（テスト再生は出力電圧も保存）": "Record raw input during input checks and test playback (including AO during test playback)",

@@ -189,6 +189,116 @@ class Page(IntEnum):
     HISTORY = 4
 
 
+class BandInput(QWidget):
+    """One shared analysis band for calibration and live SPL, stored in Setup."""
+
+    changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.nyquist = None
+        self.mode = QComboBox()
+        self.mode.setFixedWidth(150)
+        for text, value in [("全帯域", "full"), ("20–20,000 Hz", "audio"), ("指定", "custom")]:
+            index = self.mode.count()
+            self.mode.addItem(text, value)
+            bind(self.mode, "setItemText", text, index)
+        self.low = QLineEdit("20")
+        self.high = QLineEdit("20000")
+        for field, name in [(self.low, "音圧帯域の下限 [Hz]"), (self.high, "音圧帯域の上限 [Hz]")]:
+            field.setFixedWidth(94)
+            field.setAlignment(Qt.AlignmentFlag.AlignRight)
+            bind(field, "setAccessibleName", name)
+            bind(field, "setToolTip", name)
+            field.textChanged.connect(self._edited)
+        self.info = label("", muted=True)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        for widget in (
+            label("音圧計算帯域", muted=True),
+            self.mode,
+            self.low,
+            label("–"),
+            self.high,
+            label("Hz", muted=True),
+            self.info,
+        ):
+            layout.addWidget(widget)
+        layout.setStretch(6, 1)
+        bind(
+            self,
+            "setToolTip",
+            "校正・テスト再生・マイク確認のSPLに共通。DCは除外し、A/C特性は適用しません。再生波形は変わりません。",
+        )
+        self.mode.currentIndexChanged.connect(self._mode_changed)
+        self._mode_changed()
+
+    def value(self):
+        if self.mode.currentData() == "full":
+            return None
+        try:
+            low, high = float(self.low.text()), float(self.high.text())
+        except ValueError as error:
+            raise ValueError(translate(self, "帯域にはHz単位の数値を入力してください")) from error
+        if not (math.isfinite(low) and math.isfinite(high) and 0 <= low < high):
+            raise ValueError(translate(self, "帯域は 0 ≤ 下限 < 上限 で指定してください"))
+        return low, high
+
+    def setValue(self, value):
+        blocker = QSignalBlocker(self)
+        mode = "full" if value is None else "audio" if tuple(value) == (20, 20000) else "custom"
+        self.mode.setCurrentIndex(self.mode.findData(mode))
+        if value is not None:
+            self.low.setText(str(value[0]))
+            self.high.setText(str(value[1]))
+        self._mode_changed()
+        del blocker
+        self.changed.emit()
+
+    def set_sample_rate(self, rate):
+        self.nyquist = rate / 2 if rate is not None else None
+        if self.mode.currentData() == "full":
+            self._set_bounds(0, self.nyquist)
+        self._update_info()
+
+    def _set_bounds(self, low, high):
+        for field, value in [(self.low, low), (self.high, high)]:
+            blocker = QSignalBlocker(field)
+            field.setText("" if value is None else str(value))
+            del blocker
+
+    def _mode_changed(self):
+        mode = self.mode.currentData()
+        if mode == "full":
+            self._set_bounds(0, self.nyquist)
+        elif mode == "audio":
+            self._set_bounds(20, 20000)
+        for field in (self.low, self.high):
+            field.setReadOnly(mode != "custom")
+        self._edited()
+
+    def _edited(self):
+        self._update_info()
+        self.changed.emit()
+
+    def _update_info(self):
+        error = None
+        try:
+            band = self.value()
+            if self.nyquist is None:
+                error = "サンプルレートを確認してください"
+            elif band is not None and band[1] > self.nyquist:
+                error = "上限は {limit:g} Hz以下"
+        except ValueError as exc:
+            error = str(exc)
+        self.info.setStyleSheet("color: #a73338;" if error else "")
+        set_text(
+            self.info,
+            error or "上限 {limit:g} Hz · A/C補正なし",
+            limit=self.nyquist,
+        )
+
+
 def disclosure(title, content):
     wrapper = QWidget()
     layout = QVBoxLayout(wrapper)
@@ -249,11 +359,10 @@ class SetupEditor(QScrollArea):
                 ],
             ),
             "window": (
-                "再生区間・帯域",
+                "再生区間",
                 [
                     ("measurement.start_s", "開始 [s]", "float"),
                     ("measurement.stop_s", "終了 [s]", "optional_float"),
-                    ("measurement.band_hz", "帯域 [Hz]", "json_optional"),
                 ],
             ),
             "search": (
@@ -284,6 +393,11 @@ class SetupEditor(QScrollArea):
         }
         for key, (title, fields) in specs.items():
             self.blocks[key] = self._section(title, fields)
+        self.band = BandInput()
+        self.fields["measurement.band_hz"] = self.band
+        self.types["measurement.band_hz"] = "band"
+        self.band.changed.connect(self.changed.emit)
+        self.fields["daq.sample_rate_hz"].textChanged.connect(self.update_band_limit)
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 8, 0)
@@ -296,7 +410,6 @@ class SetupEditor(QScrollArea):
             "setToolTip",
             "DAQのAI/AO、WAVの変換先、生成関数に共通で使います。変更後は再基準測定が必要です。",
         )
-        bind(self.fields["measurement.band_hz"], "setPlaceholderText", "全帯域")
         bind(self.fields["measurement.stop_s"], "setPlaceholderText", "末尾まで")
         bind(
             self.fields["measurement.stop_s"],
@@ -377,7 +490,9 @@ class SetupEditor(QScrollArea):
             for part in key.split("."):
                 value = value[part]
             kind = self.types[key]
-            if kind == "terminal":
+            if kind == "band":
+                widget.setValue(value)
+            elif kind == "terminal":
                 widget.setCurrentText(value)
             elif kind == "notes":
                 widget.setPlainText(value)
@@ -388,10 +503,20 @@ class SetupEditor(QScrollArea):
         del blocker
         self.changed.emit()
 
+    def update_band_limit(self):
+        try:
+            rate = int(self.fields["daq.sample_rate_hz"].text())
+        except ValueError:
+            rate = 0
+        self.band.set_sample_rate(rate if rate >= 2 else None)
+
     def setup(self):
         payload = {"daq": {}, "measurement": {}}
         for key, widget in self.fields.items():
             kind = self.types[key]
+            if kind == "band":
+                payload["measurement"]["band_hz"] = widget.value()
+                continue
             if kind == "terminal":
                 text = widget.currentText()
             elif kind == "notes":
@@ -503,6 +628,7 @@ class SpectrumView(QWidget):
         self.spectrum = None
         self.peaks = None
         self.nyquist = 1.0
+        self.analysis_band = None
         self.setMinimumHeight(210)
 
     def set_spectrum(self, spectrum):
@@ -547,6 +673,21 @@ class SpectrumView(QWidget):
             if self.spectrum
             else [min(20, self.nyquist / 4), self.nyquist]
         )
+        if self.analysis_band is not None:
+            positions = [
+                area.left()
+                + np.log(np.clip(bound, edges[0], edges[-1]) / edges[0])
+                / np.log(edges[-1] / edges[0])
+                * area.width()
+                for bound in self.analysis_band
+            ]
+            for left, right in [(area.left(), positions[0]), (positions[1], area.right())]:
+                painter.fillRect(
+                    QRectF(left, area.top(), right - left, area.height()), QColor(8, 17, 26, 175)
+                )
+            painter.setPen(QPen(QColor("#99ece1"), 1, Qt.PenStyle.DashLine))
+            for x in positions:
+                painter.drawLine(QPointF(x, area.top()), QPointF(x, area.bottom()))
         last_right = -1
         painter.setPen(QColor("#64748b"))
         for frequency in (20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000):
@@ -651,6 +792,7 @@ class CalibrationWindow(QMainWindow):
         self.volume_control = VolumeControl(0.1)
         self._playback_start_choice = None
         self._pending_start_choice = None
+        self._meter_band = None
         content = QWidget()
         self.setCentralWidget(content)
         layout = QVBoxLayout(content)
@@ -729,6 +871,7 @@ class CalibrationWindow(QMainWindow):
     @Slot()
     def _language_changed(self):
         retranslate(self)
+        self.editor.band._update_info()
         self.waveform.update()
         self.monitor_spectrum.update()
         self.level_meter.update()
@@ -948,10 +1091,11 @@ class CalibrationWindow(QMainWindow):
     def _microphone_panel(self):
         panel = QFrame()
         panel.setObjectName("microphonePanel")
-        panel.setFixedHeight(206)
+        panel.setFixedHeight(246)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
+        layout.addWidget(self.editor.band)
         self.monitor_start = button("マイク確認", self._toggle_monitor)
         self.monitor_start.setMaximumWidth(116)
         self.spectrum_state = label("待機中", muted=True)
@@ -982,6 +1126,11 @@ class CalibrationWindow(QMainWindow):
         )
         layout.addWidget(header)
         self.monitor_spectrum = SpectrumView()
+        bind(
+            self.monitor_spectrum,
+            "setToolTip",
+            "暗い部分は音圧計算の対象外です。スペクトラムは入力電圧を表示します。",
+        )
         self.monitor_spectrum.setMinimumHeight(160)
         layout.addWidget(self.monitor_spectrum, 1)
         self.monitor_samples = np.empty(0)
@@ -1108,7 +1257,7 @@ class CalibrationWindow(QMainWindow):
         ):
             detail_layout.addWidget(widget)
         layout.addWidget(disclosure("波形情報・接続", details))
-        layout.addWidget(disclosure("再生区間・帯域", self.editor.blocks["window"]))
+        layout.addWidget(disclosure("再生区間", self.editor.blocks["window"]))
         levels = QGroupBox()
         bind(levels, "setTitle", "開始音量")
         level_layout = QHBoxLayout(levels)
@@ -1378,7 +1527,13 @@ class CalibrationWindow(QMainWindow):
         except (ValueError, TypeError):
             setup = {
                 "unvalidated": {
-                    key: widget.currentText()
+                    key: {
+                        "mode": widget.mode.currentData(),
+                        "low_hz": widget.low.text(),
+                        "high_hz": widget.high.text(),
+                    }
+                    if isinstance(widget, BandInput)
+                    else widget.currentText()
                     if isinstance(widget, QComboBox)
                     else widget.toPlainText()
                     if isinstance(widget, QPlainTextEdit)
@@ -1518,10 +1673,21 @@ class CalibrationWindow(QMainWindow):
 
     @Slot()
     def _setup_changed(self):
+        self.editor.update_band_limit()
         try:
             setup = self.editor.setup()
         except (ValueError, TypeError):
             setup = None
+        band = (
+            (setup.measurement.band_hz, setup.measurement.frequency_correction_db)
+            if setup is not None
+            else None
+        )
+        if band != self._meter_band:
+            self._playback_start_choice = None
+        self._meter_band = band
+        set_text(self.monitor_level, "—")
+        self.level_meter.set_levels(None, self.level_meter.target)
         if (
             setup is not None
             and self.stimulus is not None
@@ -1598,6 +1764,7 @@ class CalibrationWindow(QMainWindow):
             return
         self.setup_next.setEnabled(True)
         self.monitor_spectrum.nyquist = setup.daq.sample_rate_hz / 2
+        self.monitor_spectrum.analysis_band = setup.measurement.band_hz
         self.monitor_spectrum.update()
         if self.stimulus is not None:
             duration = len(self.stimulus.samples) / self.stimulus.sample_rate_hz

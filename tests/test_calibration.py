@@ -24,6 +24,7 @@ from ni_spl_calibration import (
 )
 from ni_spl_calibration.analysis import band_power, validate_capture
 from ni_spl_calibration.hardware import output_guard
+from ni_spl_calibration.meter import LiveMeter, input_metrics
 from ni_spl_calibration.storage import read_json, write_json
 
 
@@ -225,6 +226,50 @@ def test_band_power_is_energy_mean_not_median_of_blocks():
         band_power(
             samples, 20000, replace(settings, frequency_correction_db=((1500, 0), (2500, 0)))
         )
+
+
+def test_audible_band_excludes_ultrasound_from_live_spl_and_calibration():
+    rate = 200000
+    setup = Setup(
+        "band-test", "Synthetic known acoustic chain", daq=DaqSettings(sample_rate_hz=rate)
+    )
+    band_setup = replace(setup, measurement=replace(setup.measurement, band_hz=(20, 20000)))
+    ref = measure_reference(
+        setup, hardware=SimulatedHardware(setup.daq, reference_mode=True, noise_rms_v=0)
+    )
+    t = np.arange(rate // 5) / rate
+    # The 50 kHz component has 100 times the power of the audible component.
+    pressure = (
+        np.sqrt(2)
+        * 20e-6
+        * (
+            10 ** (30 / 20) * np.sin(2 * np.pi * 1000 * t)
+            + 10 ** (50 / 20) * np.sin(2 * np.pi * 50000 * t)
+        )
+    )
+    volts = pressure * ref.sensitivity_v_per_pa
+    assert input_metrics(volts, setup, ref)["level_spl_db"] == pytest.approx(50.0432137378)
+    assert input_metrics(volts, band_setup, ref)["level_spl_db"] == pytest.approx(30)
+    frames = []
+    LiveMeter(band_setup, ref, frames.append).push(volts)
+    assert len(frames) == 2
+    assert all(frame["level_spl_db"] == pytest.approx(30) for frame in frames)
+    # Restricting SPL analysis must not filter the output waveform.
+    samples = 0.01 * np.sin(2 * np.pi * 1000 * t) + 0.1 * np.sin(2 * np.pi * 50000 * t)
+    stimulus = Stimulus(samples, rate)
+    band_setup = replace(band_setup, measurement=replace(band_setup.measurement, start_scale_v=1))
+    result = calibrate(
+        stimulus,
+        setup=band_setup,
+        reference=ref,
+        target_spl_db=50,
+        hardware=SimulatedHardware(setup.daq, noise_rms_v=0),
+    )
+    output = apply_calibration(stimulus, result)
+    assert np.array_equal(output, samples * result.scale_v)
+    captured = output * ref.sensitivity_v_per_pa
+    assert input_metrics(captured, band_setup, ref)["level_spl_db"] == pytest.approx(50)
+    assert input_metrics(captured, setup, ref)["level_spl_db"] == pytest.approx(70.0432137378)
 
 
 def test_window_and_acoustic_delay_measure_only_selected_samples(setup):

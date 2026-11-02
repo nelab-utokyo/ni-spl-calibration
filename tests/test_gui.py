@@ -81,8 +81,68 @@ def test_setup_form_roundtrip_and_save_load(window, tmp_path, monkeypatch):
     assert not view.monitor_start.isEnabled()
 
 
-def test_gui_calibration_and_exact_replay_without_original_source(window, app, tmp_path):
+def test_spl_band_controls_validate_limits_and_preserve_waveform(window, app):
     view, _ = window
+    band = view.editor.band
+    assert band.value() is None
+    assert float(band.high.text()) == 16000
+    view._choose_test_tone()
+    wait_until(app, lambda: view.worker is None)
+    stimulus = view.stimulus
+    view.monitor_level.setText("70.00")
+    view.level_meter.set_levels(70, 70)
+    band.mode.setCurrentIndex(2)
+    band.low.setText("100.25")
+    band.high.setText("8000.5")
+    assert view.editor.setup().measurement.band_hz == (100.25, 8000.5)
+    assert view.monitor_spectrum.analysis_band == (100.25, 8000.5)
+    assert view.monitor_level.text() == "—"
+    assert view.level_meter.level is None
+    assert view.stimulus is stimulus
+    assert view.playback_start.isEnabled()
+    saved = view.editor.setup()
+    for low, high in [
+        ("-1", "8000"),
+        ("500", "500"),
+        ("1000", "500"),
+        ("0", "17000"),
+        ("0", "nan"),
+        ("0", ""),
+        ("abc", "8000"),
+    ]:
+        band.low.setText(low)
+        band.high.setText(high)
+        assert not view.monitor_start.isEnabled()
+        assert not view.playback_start.isEnabled()
+        with pytest.raises(ValueError):
+            view.editor.setup()
+    assert view._context()["setup"]["unvalidated"]["measurement.band_hz"]["low_hz"] == "abc"
+    view.language.setCurrentIndex(1)
+    assert band.info.text() == "Enter band limits in Hz"
+    band.mode.setCurrentIndex(1)
+    assert band.value() == (20, 20000)  # A preset is never silently clipped to Nyquist.
+    assert not view.monitor_start.isEnabled()
+    assert "16000" in band.info.text()
+    view.editor.fields["daq.sample_rate_hz"].setText("48000")
+    assert view.monitor_start.isEnabled()
+    assert band.value() == (20, 20000)
+    band.mode.setCurrentIndex(0)
+    assert float(band.high.text()) == 24000
+    assert band.high.isReadOnly()
+    view.editor.fields["daq.sample_rate_hz"].setText("44100")
+    assert float(band.high.text()) == 22050
+    view.editor.set_setup(saved)
+    assert band.value() == saved.measurement.band_hz
+    assert not band.high.isReadOnly()
+
+
+@pytest.mark.parametrize("band", [None, (1500, 2500)])
+def test_gui_calibration_and_exact_replay_without_original_source(window, app, tmp_path, band):
+    view, _ = window
+    if band is not None:
+        view.editor.band.mode.setCurrentIndex(2)
+        view.editor.band.low.setText(str(band[0]))
+        view.editor.band.high.setText(str(band[1]))
     view.measure_button.click()
     wait_until(app, lambda: view.worker is None)
     assert view.reference is not None
@@ -98,6 +158,7 @@ def test_gui_calibration_and_exact_replay_without_original_source(window, app, t
     first = view.last_output
     assert first is not None
     replay = load_replay(first)
+    assert replay.setup.measurement.band_hz == band
     assert replay.stimulus.sample_rate_hz == 32000
     assert view.iterations.rowCount() >= 2
     assert "44,100 → 32,000 Hz" in view.stimulus_info.text()
@@ -123,6 +184,7 @@ def test_gui_calibration_and_exact_replay_without_original_source(window, app, t
     assert view.stimulus.sha256 == replay.stimulus.sha256
     assert view.source_kind.currentIndex() == 1
     assert view.editor.setup() == replay.setup
+    assert view.editor.band.value() == band
     assert view.target.value() == replay.target_spl_db
     assert view.last_output is None
     view.calibrate_button.click()
@@ -145,6 +207,7 @@ def test_gui_calibration_and_exact_replay_without_original_source(window, app, t
 
 def test_monitor_updates_records_and_excludes_other_daq_operations(window, app):
     view, _ = window
+    view.editor.band.setValue((200, 8000))
     view.measure_button.click()
     wait_until(app, lambda: view.worker is None)
     view.tabs.setCurrentIndex(gui.Page.SETUP)
@@ -153,6 +216,8 @@ def test_monitor_updates_records_and_excludes_other_daq_operations(window, app):
     assert not view.measure_button.isEnabled()
     assert not view.calibrate_button.isEnabled()
     assert not view.mode.isEnabled()
+    assert not view.editor.band.mode.isEnabled()
+    assert not view.editor.band.low.isEnabled()
     assert view.monitor_spectrum.spectrum is not None
     assert view.monitor_rms.text() != "—"
     assert view.monitor_level.text() not in {"—", "未校正"}
@@ -173,6 +238,7 @@ def test_monitor_updates_records_and_excludes_other_daq_operations(window, app):
     assert read_json(directory / "summary.json")["captured_samples"] >= 6400
     assert not list(directory.glob("capture-*.npz"))
     assert read_json(directory / "monitor.json")["save_capture"] is False
+    assert read_json(directory / "setup.json")["measurement"]["band_hz"] == [200, 8000]
     assert "停止" in view.spectrum_state.text()
     events = [read_json(path) for path in view.activity.directory.glob("events/*.json")]
     assert any(
@@ -365,6 +431,7 @@ def test_translation_templates_have_matching_parameters():
 
 def test_test_playback_fader_stereo_monitor_mute_and_mid_file_stop(window, app, tmp_path):
     view, _ = window
+    view.editor.band.setValue((500, 5000))
     source_rate = 44100
     t = np.arange(source_rate * 2) / source_rate
     wav = tmp_path / "music-stereo.wav"
@@ -390,6 +457,7 @@ def test_test_playback_fader_stereo_monitor_mute_and_mid_file_stop(window, app, 
     assert view.volume_fader.isEnabled()
     assert view.mute_button.isEnabled()
     assert not view.measure_button.isEnabled()
+    assert not view.editor.band.mode.isEnabled()
     assert view.stimulus.provenance["source_channels"] == 2
     assert view.stimulus.provenance["channel_mode"] == "mix"
     assert view.stimulus.sample_rate_hz == 32000
@@ -413,6 +481,7 @@ def test_test_playback_fader_stereo_monitor_mute_and_mid_file_stop(window, app, 
     assert summary["duration_s"] < 2  # Stopped inside the original two-second file.
     assert not list(directory.glob("capture-*.npz"))
     assert read_json(directory / "playback.json")["save_capture"] is False
+    assert read_json(directory / "setup.json")["measurement"]["band_hz"] == [500, 5000]
     assert view.playback_peak.text() == "0"
     assert view.measure_button.isEnabled()
     assert not view.playback_stop.isEnabled()
