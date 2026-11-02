@@ -667,15 +667,25 @@ class CalibrationWindow(QMainWindow):
         self.language.addItem("日本語", "ja")
         self.language.addItem("English", "en")
         self.language.setFixedWidth(102)
-        bind(self.language, "setToolTip", "表示言語")
+        self.language.setToolTip("Language / 言語")
+        self.language.setAccessibleName("Language / 言語")
+        # Discoverable even before the user can read the selected UI language.
+        self.language_label = QLabel("Language")
+        self.language_label.setObjectName("muted")
+        self.language_label.setBuddy(self.language)
         self.output_root = QLineEdit(str(Path.cwd() / "results"))
         browse = button("…", self._choose_output)
         browse.setFixedWidth(38)
         bind(browse, "setToolTip", "保存フォルダを選択")
         toolbar = row(
-            self.mode, self.language, label("保存先", muted=True), self.output_root, browse
+            self.mode,
+            self.language_label,
+            self.language,
+            label("保存先", muted=True),
+            self.output_root,
+            browse,
         )
-        toolbar.layout().setStretch(3, 1)
+        toolbar.layout().setStretch(4, 1)
         layout.addWidget(toolbar)
         self.tabs = QTabWidget()
         self._scroll_areas = {}
