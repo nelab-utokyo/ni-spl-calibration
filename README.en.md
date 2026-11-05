@@ -6,9 +6,9 @@ Find the **voltage scale needed to play a particular waveform and interval at a 
 
 ## Installation
 
-Windows x64 portable ZIP builds run without Python or uv. See [Windows distribution and builds](docs/windows.en.md). Physical NI hardware still requires a separately installed NI-DAQmx driver.
+For Windows x64, [download the ZIP from Releases](https://github.com/nelab-utokyo/ni-spl-calibration/releases/latest), extract it completely, and launch `NI-SPL-Calibration.exe`. Python and uv are not required. See [Windows distribution and builds](docs/windows.en.md) for details.
 
-Use Git, Python 3.11 or later, and [uv](https://docs.astral.sh/uv/).
+For the source distribution, use Git, Python 3.11 or later, and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 git clone https://github.com/kmraven/ni-spl-calibration.git

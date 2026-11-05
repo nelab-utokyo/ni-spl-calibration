@@ -6,9 +6,9 @@ WAV・生成関数・NumPy配列から、**指定した波形・区間を目標�
 
 ## 導入
 
-Windows x64向けには、Python・uv不要のポータブルZIPもビルドできます。[Windows版の配布・ビルド](docs/windows.md)を参照してください。NI実機には別途NI-DAQmxドライバが必要です。
+Windows x64版は[ReleasesからZIPをダウンロード](https://github.com/nelab-utokyo/ni-spl-calibration/releases/latest)し、全体を展開して `NI-SPL-Calibration.exe` を起動します。Python・uvは不要です。詳細は[Windows版の配布・ビルド](docs/windows.md)を参照してください。
 
-Git、Python 3.11以上、[uv](https://docs.astral.sh/uv/)を使用します。
+ソース版はGit、Python 3.11以上、[uv](https://docs.astral.sh/uv/)を使用します。
 
 ```sh
 git clone https://github.com/kmraven/ni-spl-calibration.git
