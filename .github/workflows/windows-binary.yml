@@ -35,7 +35,10 @@ jobs:
       - name: Install locked build and runtime dependencies
         run: uv sync --locked --extra gui --extra daq --extra dev --group build
       - name: Test on Windows
-        run: uv run --no-sync pytest
+        run: uv run --no-sync pytest --junitxml=build/test-results.xml
+      - name: Report test failures
+        if: failure()
+        run: uv run --no-sync python packaging/report_tests.py
       - name: Check release version
         if: startsWith(github.ref, 'refs/tags/')
         env:
@@ -61,6 +64,7 @@ jobs:
           path: |
             dist/windows-smoke-test.json
             build/pyinstaller/**/warn-*.txt
+            build/test-results.xml
           if-no-files-found: ignore
 
   release:
