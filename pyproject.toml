@@ -14,6 +14,9 @@ dev = ["pytest>=8.2", "ruff>=0.12"]
 [project.scripts]
 ni-spl = "ni_spl_calibration.cli:main"
 
+[dependency-groups]
+build = ["pyinstaller>=6.16,<7"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

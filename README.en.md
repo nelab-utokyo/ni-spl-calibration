@@ -6,6 +6,8 @@ Find the **voltage scale needed to play a particular waveform and interval at a 
 
 ## Installation
 
+Windows x64 portable ZIP builds run without Python or uv. See [Windows distribution and builds](docs/windows.en.md). Physical NI hardware still requires a separately installed NI-DAQmx driver.
+
 Use Git, Python 3.11 or later, and [uv](https://docs.astral.sh/uv/).
 
 ```sh

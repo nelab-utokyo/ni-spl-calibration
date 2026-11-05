@@ -19,6 +19,7 @@ from PySide6.QtCore import (
     QPointF,
     QRectF,
     QSignalBlocker,
+    QStandardPaths,
     Qt,
     QThread,
     QUrl,
@@ -840,7 +841,14 @@ class CalibrationWindow(QMainWindow):
         self.language_label = QLabel("Language")
         self.language_label.setObjectName("muted")
         self.language_label.setBuddy(self.language)
-        self.output_root = QLineEdit(str(Path.cwd() / "results"))
+        if getattr(sys, "frozen", False):
+            documents = QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.DocumentsLocation
+            )
+            output_root = Path(documents or str(Path.home())) / "NI SPL Calibration" / "results"
+        else:
+            output_root = Path.cwd() / "results"
+        self.output_root = QLineEdit(str(output_root))
         browse = button("…", self._choose_output)
         browse.setFixedWidth(38)
         bind(browse, "setToolTip", "保存フォルダを選択")

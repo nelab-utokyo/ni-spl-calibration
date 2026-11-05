@@ -2,3 +2,5 @@ include README.md README.en.md uv.lock .python-version
 recursive-include docs *.md
 recursive-include examples *.py *.yaml
 recursive-include tests *.py
+recursive-include packaging *.py *.txt *.md
+include .github/workflows/windows-binary.yml
