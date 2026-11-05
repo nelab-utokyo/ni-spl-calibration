@@ -428,7 +428,7 @@ def run_queue(
                 "status": job.status,
                 "measured_spl_db": job.result["measured_spl_db"] if job.result else None,
                 "scale_v": job.result["scale_v"] if job.result else None,
-                "output": str(job.output.relative_to(directory))
+                "output": job.output.relative_to(directory).as_posix()
                 if job.output and job.output.is_relative_to(directory)
                 else f"prior-runs/{job.id}"
                 if (directory / "prior-runs" / job.id).is_dir()

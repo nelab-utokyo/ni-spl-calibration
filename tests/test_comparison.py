@@ -1,4 +1,5 @@
 import csv
+import json
 from dataclasses import replace
 from threading import Event
 
@@ -293,3 +294,25 @@ def test_short_stimulus_also_updates_the_input_spectrum(tmp_path, source):
     assert len(frames) == 2  # Background and playback are displayed separately.
     assert all(frame["spectrum"]["levels_dbv"] for frame in frames)
     assert len(frames[-1]["samples"]) == 161
+
+
+def test_windows_comparison_manifests_remain_portable(tmp_path, source):
+    output = tmp_path / "comparison"
+    run_comparison(output, [source], position="Windows record")
+    manifest = output / "comparison.json"
+    payload = read_json(manifest)
+    assert all("\\" not in name for name in payload["files"])
+    # Reproduce the older Windows writer's path spelling and valid checksums.
+    payload["files"] = {
+        name.replace("/", "\\"): digest for name, digest in payload["files"].items()
+    }
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    (output / "input-checksums.json").write_text(
+        json.dumps({"comparison.json": file_sha256(manifest)}), encoding="utf-8"
+    )
+    seal = read_json(output / "checksums.json")
+    seal["files"] = {name.replace("/", "\\"): file_sha256(output / name) for name in seal["files"]}
+    (output / "checksums.json").write_text(json.dumps(seal), encoding="utf-8")
+    restored = load_comparison(output)
+    assert restored.rows[0]["position"] == "Windows record"
+    assert restored.rows[0]["status"] == "complete"

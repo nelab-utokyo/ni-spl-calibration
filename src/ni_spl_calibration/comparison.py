@@ -212,7 +212,7 @@ def run_comparison(
         _check_cancelled(cancel_requested)
         directory = output / "calibrations" / source.id
         _save_baseline(source, directory)
-        files.extend(str(p.relative_to(output)) for p in directory.iterdir())
+        files.extend(p.relative_to(output).as_posix() for p in directory.iterdir())
         entries.append(
             {
                 "id": source.id,
@@ -336,10 +336,22 @@ def run_comparison(
         output / "checksums.json",
         {
             "schema_version": 1,
-            "files": {str(p.relative_to(output)): file_sha256(p) for p in paths},
+            "files": {p.relative_to(output).as_posix(): file_sha256(p) for p in paths},
         },
     )
     return {"directory": output, **summary}
+
+
+def _manifest_paths(files):
+    # Version-1 Windows writers used backslashes. Verify the original manifest
+    # hash first, then normalize only names that will be checked against allowlists.
+    normalized = {}
+    for name, digest in files.items():
+        canonical = name.replace("\\", "/")
+        if canonical in normalized:
+            raise ValueError("Duplicate comparison manifest path")
+        normalized[canonical] = digest
+    return normalized
 
 
 def load_comparison(directory):
@@ -364,14 +376,15 @@ def load_comparison(directory):
         for value in ids
         for name in (*INPUT_FILES, "result.json", "run.json", "checksums.json")
     }
-    if payload["files"].keys() != allowed_inputs:
+    input_files = _manifest_paths(payload["files"])
+    if input_files.keys() != allowed_inputs:
         raise ValueError("Invalid comparison file manifest")
-    for name, digest in payload["files"].items():
+    for name, digest in input_files.items():
         if file_sha256(directory / name) != digest:
             raise ValueError("Comparison record integrity check failed")
     if (directory / "checksums.json").is_file():
         hashes = read_json(directory / "checksums.json")
-        for name, digest in hashes["files"].items():
+        for name, digest in _manifest_paths(hashes["files"]).items():
             # A record cannot make the loader open arbitrary paths.
             if name not in allowed_inputs | {
                 "comparison.json",
