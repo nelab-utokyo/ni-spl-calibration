@@ -99,6 +99,7 @@ def run():
             return {
                 "status": "complete",
                 "frozen": bool(getattr(sys, "frozen", False)),
+                "qt_platform": app.platformName(),
                 "runtime": versions,
                 "checks": [
                     "NI imports without driver",

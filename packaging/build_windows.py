@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -108,9 +109,18 @@ def main():
     (folder / "THIRD-PARTY-NOTICES.txt").write_text("\n".join(sorted(notices)), encoding="utf-8")
     # Test the actual executable, not imports from the build environment.
     report = ROOT / "dist" / "windows-smoke-test.json"
-    subprocess.run(
-        [str(folder / f"{APP_NAME}.exe"), "--smoke-test", str(report)], check=True, timeout=180
+    completed = subprocess.run(
+        [str(folder / f"{APP_NAME}.exe"), "--smoke-test", str(report)],
+        env={**os.environ, "QT_QPA_PLATFORM": "windows"},
+        timeout=180,
     )
+    if completed.returncode != 0:
+        details = (
+            report.read_text(encoding="utf-8")
+            if report.is_file()
+            else "No smoke-test report was produced"
+        )
+        raise RuntimeError(f"Packaged executable failed ({completed.returncode}): {details}")
     result = json.loads(report.read_text(encoding="utf-8"))
     if result.get("status") != "complete" or not result.get("frozen"):
         raise RuntimeError(f"Frozen smoke test failed: {report}")
@@ -126,4 +136,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        message = str(error).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error::{message}")
+        raise
